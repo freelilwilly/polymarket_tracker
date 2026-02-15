@@ -145,15 +145,31 @@ class PolymarketTracker:
         Returns:
             List of new trades
         """
-        current_ids = {trade.get("id"): trade for trade in current_trades}
+        current_ids = {self._trade_key(trade): trade for trade in current_trades}
         new_trades = []
         
         for trade_id, trade in current_ids.items():
-            if trade_id not in self.last_trades:
+            if trade_id and trade_id not in self.last_trades:
                 new_trades.append(trade)
         
         self.last_trades = current_ids
         return new_trades
+
+    @staticmethod
+    def _trade_key(trade: Dict[str, Any]) -> str:
+        """Build a stable identifier for a trade event."""
+        trade_id = trade.get("id")
+        if trade_id is not None:
+            return str(trade_id)
+
+        tx_hash = trade.get("transactionHash") or ""
+        timestamp = trade.get("timestamp") or ""
+        asset = trade.get("asset") or ""
+        outcome = trade.get("outcome") or ""
+        side = trade.get("side") or ""
+        size = trade.get("size") or ""
+        price = trade.get("price") or ""
+        return f"{tx_hash}:{timestamp}:{asset}:{outcome}:{side}:{size}:{price}"
 
     async def _notify_callbacks(self, activity_data: Dict[str, Any]):
         """
@@ -177,6 +193,19 @@ class PolymarketTracker:
         self.running = True
         
         logger.info(f"Starting poll tracker for account: {self.account_address}")
+
+        # Seed the baseline so restarts don't tweet historical trades
+        try:
+            existing_trades = await self.get_user_trades()
+            seeded_trades: Dict[str, Any] = {}
+            for trade in existing_trades:
+                trade_key = self._trade_key(trade)
+                if trade_key:
+                    seeded_trades[trade_key] = trade
+            self.last_trades = seeded_trades
+            logger.info(f"Seeded {len(self.last_trades)} existing trades; monitoring only new trades")
+        except Exception as e:
+            logger.error(f"Failed to seed existing trades at startup: {e}")
         
         while self.running:
             try:
@@ -231,8 +260,8 @@ class PolymarketTracker:
         size = trade.get("size", 0)
         price = trade.get("price", 0)
         screen_name = (
-            trade.get("pseudonym")
-            or trade.get("name")
+            trade.get("name")
+            or trade.get("pseudonym")
             or self._short_wallet(trade.get("proxyWallet", ""))
             or "Unknown Trader"
         )
