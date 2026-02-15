@@ -63,6 +63,7 @@ TWITTER_BEARER_TOKEN=your_bearer_token
 # Settings
 POLL_INTERVAL=5                    # Seconds between checks
 TWEET_TEMPLATE=default             # Format: default, detailed, or minimal
+DRY_RUN=false                      # When true, do not post tweets
 ```
 
 ## Usage
@@ -79,6 +80,17 @@ The bot will:
 3. ✅ Test Polymarket API connectivity
 4. 🔔 Start monitoring your account for trades
 5. 🐦 Automatically tweet new trades
+
+### Dry Run Mode
+
+Use dry run to test trade detection without posting tweets:
+
+```bash
+# .env
+DRY_RUN=true
+```
+
+When enabled, the bot logs the tweet text but does not post it.
 
 ### Tweet Templates
 

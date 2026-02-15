@@ -29,22 +29,25 @@ class PolymarketTwitterBot:
         self.polymarket_address = os.getenv("POLYMARKET_ACCOUNT_ADDRESS")
         self.poll_interval = int(os.getenv("POLL_INTERVAL", 5))
         self.tweet_template = os.getenv("TWEET_TEMPLATE", "default")
+        self.dry_run = self._parse_bool(os.getenv("DRY_RUN", "false"))
 
         if not self.polymarket_address or self.polymarket_address == "0x":
             raise ValueError("❌ POLYMARKET_ACCOUNT_ADDRESS not configured in .env")
 
-        # Initialize Twitter client
-        try:
-            self.twitter = TwitterClient(
-                api_key=os.getenv("TWITTER_API_KEY"),
-                api_secret=os.getenv("TWITTER_API_SECRET"),
-                access_token=os.getenv("TWITTER_ACCESS_TOKEN"),
-                access_secret=os.getenv("TWITTER_ACCESS_SECRET"),
-                bearer_token=os.getenv("TWITTER_BEARER_TOKEN")
-            )
-        except Exception as e:
-            logger.error(f"Failed to initialize Twitter client: {e}")
-            raise
+        # Initialize Twitter client (skip in dry-run mode)
+        self.twitter = None
+        if not self.dry_run:
+            try:
+                self.twitter = TwitterClient(
+                    api_key=os.getenv("TWITTER_API_KEY"),
+                    api_secret=os.getenv("TWITTER_API_SECRET"),
+                    access_token=os.getenv("TWITTER_ACCESS_TOKEN"),
+                    access_secret=os.getenv("TWITTER_ACCESS_SECRET"),
+                    bearer_token=os.getenv("TWITTER_BEARER_TOKEN")
+                )
+            except Exception as e:
+                logger.error(f"Failed to initialize Twitter client: {e}")
+                raise
 
         # Initialize Polymarket tracker
         self.tracker = PolymarketTracker(
@@ -69,6 +72,10 @@ class PolymarketTwitterBot:
                 # Format and post tweet
                 tweet_text = self.tracker.format_trade_for_tweet(trade, self.tweet_template)
                 
+                if self.dry_run:
+                    logger.info(f"[DRY RUN] Tweet suppressed: {tweet_text}")
+                    return
+
                 logger.info(f"Posting tweet: {tweet_text}")
                 success = await self.twitter.tweet(tweet_text)
                 
@@ -90,10 +97,13 @@ class PolymarketTwitterBot:
         logger.info("🔍 Validating setup...")
 
         # Validate Twitter credentials
-        if not self.twitter.validate_credentials():
-            logger.error("❌ Twitter credentials invalid")
-            return False
-        logger.info("✅ Twitter credentials valid")
+        if self.dry_run:
+            logger.info("🧪 Dry run enabled: skipping Twitter credential validation")
+        else:
+            if not self.twitter.validate_credentials():
+                logger.error("❌ Twitter credentials invalid")
+                return False
+            logger.info("✅ Twitter credentials valid")
 
         # Validate Polymarket address format
         if not self.polymarket_address.startswith("0x") or len(self.polymarket_address) != 42:
@@ -125,6 +135,7 @@ class PolymarketTwitterBot:
             logger.info(f"📊 Monitoring account: {self.polymarket_address}")
             logger.info(f"⏱️  Poll interval: {self.poll_interval} seconds")
             logger.info(f"🎨 Tweet template: {self.tweet_template}")
+            logger.info(f"🧪 Dry run: {self.dry_run}")
             logger.info("\n🔔 Now monitoring for trades... (Press Ctrl+C to stop)\n")
 
             # Start polling
@@ -142,6 +153,11 @@ class PolymarketTwitterBot:
         logger.info("Cleaning up...")
         await self.tracker.stop()
         logger.info("✅ Bot stopped")
+
+    @staticmethod
+    def _parse_bool(value: str) -> bool:
+        """Parse a truthy/falsey environment string."""
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 async def main():
