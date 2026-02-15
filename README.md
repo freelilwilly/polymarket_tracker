@@ -14,7 +14,7 @@ A real-time monitoring tool that tracks Polymarket account trades and automatica
 ## Prerequisites
 
 - Python 3.8+
-- A Polymarket account with an Ethereum wallet address
+- One or more Polymarket accounts with Ethereum wallet addresses
 - Twitter Developer Account with API v2 credentials
 
 ## Installation
@@ -51,7 +51,11 @@ cp .env.example .env
 
 ```bash
 # .env
-POLYMARKET_ACCOUNT_ADDRESS=0x1234567890abcdef...  # Your 0x-prefixed wallet address
+# Option 1 (recommended): monitor multiple 0x-prefixed wallet addresses
+POLYMARKET_ACCOUNT_ADDRESSES=0x1234567890abcdef...,0xabcdef1234567890...
+
+# Option 2 (single address, backward-compatible)
+POLYMARKET_ACCOUNT_ADDRESS=0x1234567890abcdef...
 
 # Twitter Credentials
 TWITTER_API_KEY=your_api_key
@@ -77,8 +81,8 @@ python main.py
 The bot will:
 1. ✅ Validate your configuration
 2. ✅ Test Twitter credentials
-3. ✅ Test Polymarket API connectivity
-4. 🔔 Start monitoring your account for trades
+3. ✅ Test Polymarket API connectivity for each configured account
+4. 🔔 Start monitoring all configured accounts for trades
 5. 🐦 Automatically tweet new trades
 
 ### Dry Run Mode
@@ -202,9 +206,9 @@ Base URL: `https://data-api.polymarket.com`
 
 ## Troubleshooting
 
-### "POLYMARKET_ACCOUNT_ADDRESS not configured"
-- Ensure your `.env` file exists and has the account address
-- Address must be 0x-prefixed and 40 hex characters
+### "No Polymarket addresses configured"
+- Ensure your `.env` file exists and has `POLYMARKET_ACCOUNT_ADDRESSES` or `POLYMARKET_ACCOUNT_ADDRESS`
+- Each address must be 0x-prefixed and 40 hex characters
 
 ### "Twitter credentials invalid"
 - Verify all Twitter credentials in `.env`

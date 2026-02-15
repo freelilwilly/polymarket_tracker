@@ -4,7 +4,7 @@ import os
 from dotenv import load_dotenv
 from polymarket_tracker import PolymarketTracker
 from twitter_client import TwitterClient
-from typing import Dict, Any
+from typing import Dict, Any, List
 
 # Load environment variables
 load_dotenv()
@@ -26,13 +26,15 @@ class PolymarketTwitterBot:
 
     def __init__(self):
         """Initialize the bot with configuration from environment variables."""
-        self.polymarket_address = os.getenv("POLYMARKET_ACCOUNT_ADDRESS")
+        self.polymarket_addresses = self._parse_account_addresses()
         self.poll_interval = int(os.getenv("POLL_INTERVAL", 5))
         self.tweet_template = os.getenv("TWEET_TEMPLATE", "default")
         self.dry_run = self._parse_bool(os.getenv("DRY_RUN", "false"))
 
-        if not self.polymarket_address or self.polymarket_address == "0x":
-            raise ValueError("❌ POLYMARKET_ACCOUNT_ADDRESS not configured in .env")
+        if not self.polymarket_addresses:
+            raise ValueError(
+                "❌ No Polymarket addresses configured. Set POLYMARKET_ACCOUNT_ADDRESSES or POLYMARKET_ACCOUNT_ADDRESS in .env"
+            )
 
         # Initialize Twitter client (skip in dry-run mode)
         self.twitter = None
@@ -49,43 +51,43 @@ class PolymarketTwitterBot:
                 logger.error(f"Failed to initialize Twitter client: {e}")
                 raise
 
-        # Initialize Polymarket tracker
-        self.tracker = PolymarketTracker(
-            account_address=self.polymarket_address,
-            poll_interval=self.poll_interval
-        )
-        
-        # Register callback for new trades
-        self.tracker.register_activity_callback(self.on_new_trade)
+        # Initialize Polymarket trackers
+        self.trackers: List[PolymarketTracker] = []
+        self.poll_tasks: List[asyncio.Task] = []
+        for address in self.polymarket_addresses:
+            tracker = PolymarketTracker(
+                account_address=address,
+                poll_interval=self.poll_interval
+            )
+            tracker.register_activity_callback(self._build_trade_callback(tracker, address))
+            self.trackers.append(tracker)
 
-    async def on_new_trade(self, activity_data: Dict[str, Any]):
-        """
-        Callback when a new trade is detected.
-        
-        Args:
-            activity_data: Activity event data
-        """
-        try:
-            if activity_data.get("type") == "trade":
-                trade = activity_data.get("trade", {})
-                
-                # Format and post tweet
-                tweet_text = self.tracker.format_trade_for_tweet(trade, self.tweet_template)
-                
-                if self.dry_run:
-                    logger.info(f"[DRY RUN] Tweet suppressed: {tweet_text}")
-                    return
+    def _build_trade_callback(self, tracker: PolymarketTracker, address: str):
+        """Create per-tracker callback for new trades."""
+        async def on_new_trade(activity_data: Dict[str, Any]):
+            try:
+                if activity_data.get("type") == "trade":
+                    trade = activity_data.get("trade", {})
 
-                logger.info(f"Posting tweet: {tweet_text}")
-                success = await self.twitter.tweet(tweet_text)
-                
-                if success:
-                    logger.info("✅ Trade tweet posted successfully!")
-                else:
-                    logger.error("❌ Failed to post trade tweet")
-                    
-        except Exception as e:
-            logger.error(f"Error handling new trade: {e}")
+                    # Format and post tweet
+                    tweet_text = tracker.format_trade_for_tweet(trade, self.tweet_template)
+
+                    if self.dry_run:
+                        logger.info(f"[DRY RUN] [{address}] Tweet suppressed: {tweet_text}")
+                        return
+
+                    logger.info(f"[{address}] Posting tweet: {tweet_text}")
+                    success = await self.twitter.tweet(tweet_text)
+
+                    if success:
+                        logger.info(f"✅ [{address}] Trade tweet posted successfully!")
+                    else:
+                        logger.error(f"❌ [{address}] Failed to post trade tweet")
+
+            except Exception as e:
+                logger.error(f"Error handling new trade for {address}: {e}")
+
+        return on_new_trade
 
     async def validate_setup(self) -> bool:
         """
@@ -105,19 +107,24 @@ class PolymarketTwitterBot:
                 return False
             logger.info("✅ Twitter credentials valid")
 
-        # Validate Polymarket address format
-        if not self.polymarket_address.startswith("0x") or len(self.polymarket_address) != 42:
-            logger.error("❌ Invalid Polymarket address format (should be 0x-prefixed, 40 hex chars)")
-            return False
-        logger.info(f"✅ Polymarket address valid: {self.polymarket_address}")
+        # Validate Polymarket address format and connectivity
+        for tracker in self.trackers:
+            address = tracker.account_address
+            if not address.startswith("0x") or len(address) != 42:
+                logger.error(
+                    f"❌ Invalid Polymarket address format for {address} (should be 0x-prefixed, 40 hex chars)"
+                )
+                return False
+            logger.info(f"✅ Polymarket address valid: {address}")
 
-        # Test API connectivity
-        try:
-            positions = await self.tracker.get_user_positions()
-            logger.info(f"✅ Successfully connected to Polymarket Data API (found {len(positions)} positions)")
-        except Exception as e:
-            logger.error(f"❌ Failed to connect to Polymarket Data API: {e}")
-            return False
+            try:
+                positions = await tracker.get_user_positions()
+                logger.info(
+                    f"✅ Successfully connected to Polymarket Data API for {address} (found {len(positions)} positions)"
+                )
+            except Exception as e:
+                logger.error(f"❌ Failed to connect to Polymarket Data API for {address}: {e}")
+                return False
 
         return True
 
@@ -132,14 +139,15 @@ class PolymarketTwitterBot:
                 return
 
             logger.info("✅ Setup validation passed!")
-            logger.info(f"📊 Monitoring account: {self.polymarket_address}")
+            logger.info(f"📊 Monitoring {len(self.trackers)} account(s): {', '.join(self.polymarket_addresses)}")
             logger.info(f"⏱️  Poll interval: {self.poll_interval} seconds")
             logger.info(f"🎨 Tweet template: {self.tweet_template}")
             logger.info(f"🧪 Dry run: {self.dry_run}")
             logger.info("\n🔔 Now monitoring for trades... (Press Ctrl+C to stop)\n")
 
-            # Start polling
-            await self.tracker.start_polling()
+            # Start polling all trackers concurrently
+            self.poll_tasks = [asyncio.create_task(tracker.start_polling()) for tracker in self.trackers]
+            await asyncio.gather(*self.poll_tasks)
 
         except KeyboardInterrupt:
             logger.info("\n⏹️  Stopping bot...")
@@ -151,13 +159,43 @@ class PolymarketTwitterBot:
     async def shutdown(self):
         """Clean up resources."""
         logger.info("Cleaning up...")
-        await self.tracker.stop()
+
+        for tracker in self.trackers:
+            await tracker.stop()
+
+        for task in self.poll_tasks:
+            if not task.done():
+                task.cancel()
+
+        if self.poll_tasks:
+            await asyncio.gather(*self.poll_tasks, return_exceptions=True)
+
         logger.info("✅ Bot stopped")
 
     @staticmethod
     def _parse_bool(value: str) -> bool:
         """Parse a truthy/falsey environment string."""
         return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    @staticmethod
+    def _parse_account_addresses() -> List[str]:
+        """Parse account addresses from env, supporting single and multi-address variables."""
+        addresses_value = os.getenv("POLYMARKET_ACCOUNT_ADDRESSES", "")
+        if addresses_value.strip():
+            addresses = [value.strip() for value in addresses_value.split(",") if value.strip()]
+        else:
+            fallback_address = os.getenv("POLYMARKET_ACCOUNT_ADDRESS", "").strip()
+            addresses = [fallback_address] if fallback_address else []
+
+        deduped: List[str] = []
+        seen = set()
+        for address in addresses:
+            normalized = address.lower()
+            if normalized not in seen:
+                deduped.append(address)
+                seen.add(normalized)
+
+        return deduped
 
 
 async def main():
@@ -169,7 +207,7 @@ async def main():
         logger.error(f"Configuration error: {e}")
         print("\n📝 Please set up your .env file:")
         print("   1. Copy .env.example to .env")
-        print("   2. Add your Polymarket account address")
+        print("   2. Add your Polymarket account address(es)")
         print("   3. Add your Twitter API v2 credentials")
     except Exception as e:
         logger.error(f"Fatal error: {e}")
