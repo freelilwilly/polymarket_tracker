@@ -98,6 +98,7 @@ When enabled, the bot logs the tweet text but does not post it.
 ```
 📊 Just traded on Polymarket!
 
+Trader: ScreenName
 Market Title
 Outcome
 Size: X @ $Y.ZZ

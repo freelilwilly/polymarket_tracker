@@ -230,8 +230,28 @@ class PolymarketTracker:
         outcome = trade.get("outcome", "Unknown")
         size = trade.get("size", 0)
         price = trade.get("price", 0)
+        screen_name = (
+            trade.get("pseudonym")
+            or trade.get("name")
+            or self._short_wallet(trade.get("proxyWallet", ""))
+            or "Unknown Trader"
+        )
         
-        return f"📊 Just traded on Polymarket!\n\n{title}\n{outcome}\nSize: {size} @ ${price:.2f}\n\n#Polymarket #Prediction"
+        return (
+            f"📊 Just traded on Polymarket!\n\n"
+            f"Trader: {screen_name}\n"
+            f"{title}\n"
+            f"{outcome}\n"
+            f"Size: {size} @ ${price:.2f}\n\n"
+            f"#Polymarket #Prediction"
+        )
+
+    @staticmethod
+    def _short_wallet(wallet: str) -> str:
+        """Return shortened wallet address for display."""
+        if not wallet or len(wallet) < 10:
+            return wallet
+        return f"{wallet[:6]}...{wallet[-4:]}"
 
     def _format_detailed(self, trade: Dict[str, Any]) -> str:
         """Detailed tweet format."""
