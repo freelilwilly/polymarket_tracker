@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from logging.handlers import RotatingFileHandler
 from dotenv import load_dotenv
 from polymarket_tracker import PolymarketTracker
 from twitter_client import TwitterClient
@@ -14,7 +15,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('polymarket_tracker.log'),
+        RotatingFileHandler('polymarket_tracker.log', maxBytes=10 * 1024 * 1024, backupCount=5),
         logging.StreamHandler()
     ]
 )
