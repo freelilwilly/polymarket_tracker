@@ -35,11 +35,11 @@ class PolymarketTopUsersLiveBot:
 
         self.output_file = os.getenv("V2_OUTPUT_FILE", "test_output.txt")
         self.daily_rebuild_seconds = int(os.getenv("V2_DAILY_POLL_SECONDS", "86400"))
-        self.trade_poll_seconds = int(os.getenv("V2_TRADE_POLL_SECONDS", "60"))
+        self.trade_poll_seconds = int(os.getenv("V2_TRADE_POLL_SECONDS", "30"))
         self.run_once = self._parse_bool(os.getenv("V2_RUN_ONCE", "false"))
         self.dry_run = self._parse_bool(os.getenv("DRY_RUN", "true"))
 
-        self.top_n = int(os.getenv("V2_TOP_USERS", "5"))
+        self.top_n = int(os.getenv("V2_TOP_USERS", "10"))
         self.candidate_limit = int(os.getenv("V2_CANDIDATE_LIMIT", "300"))
         self.leaderboard_page_size = int(os.getenv("V2_LEADERBOARD_PAGE_SIZE", "100"))
         self.min_win_rate = float(os.getenv("V2_MIN_WIN_RATE", "80"))
