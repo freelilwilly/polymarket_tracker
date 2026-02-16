@@ -692,7 +692,7 @@ class PolymarketTopUsersLiveBot:
         category_hashtag = "".join(ch for ch in category if ch.isalnum()) or "Prediction"
 
         return (
-            "📊 Top Trader Activity\n\n"
+            "📊 Polymarket Trade Activity\n\n"
             f"Category: {category}\n"
             f"Trader: {user['display_name']}\n"
             f"{title}\n"
