@@ -43,6 +43,10 @@ env/
 *.log
 polymarket_tracker.log
 
+# Local dry-run artifacts
+test_output.txt
+test_output.text
+
 # Cache
 .pytest_cache/
 .coverage

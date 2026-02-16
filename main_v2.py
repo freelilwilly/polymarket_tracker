@@ -33,7 +33,7 @@ class PolymarketTopUsersLiveBot:
         self.gamma_api_base = "https://gamma-api.polymarket.com"
         self.analytics_api_base = "https://polymarketanalytics.com"
 
-        self.output_file = os.getenv("V2_OUTPUT_FILE", "test_output.text")
+        self.output_file = os.getenv("V2_OUTPUT_FILE", "test_output.txt")
         self.daily_rebuild_seconds = int(os.getenv("V2_DAILY_POLL_SECONDS", "86400"))
         self.trade_poll_seconds = int(os.getenv("V2_TRADE_POLL_SECONDS", "60"))
         self.run_once = self._parse_bool(os.getenv("V2_RUN_ONCE", "false"))
@@ -101,9 +101,9 @@ class PolymarketTopUsersLiveBot:
                         await asyncio.sleep(max(0.0, sleep_seconds))
                         continue
 
-                        text = await response.text()
-                        logger.warning(f"GET {url} failed ({response.status}): {text[:180]}")
-                        return None
+                    text = await response.text()
+                    logger.warning(f"GET {url} failed ({response.status}): {text[:180]}")
+                    return None
             except Exception as error:
                 if attempt == max_attempts:
                     logger.error(f"Request error for {url}: {error}")
@@ -288,12 +288,167 @@ class PolymarketTopUsersLiveBot:
         self.market_cache[slug] = info
         return info
 
+    async def get_trade_category(self, trade: Dict[str, Any]) -> str:
+        event_slug = trade.get("eventSlug")
+        market_keys = [
+            trade.get("slug"),
+            event_slug,
+            trade.get("conditionId") or trade.get("condition_id"),
+            trade.get("marketId") or trade.get("market_id"),
+        ]
+        market_keys = [str(value) for value in market_keys if value]
+
+        for market_key in market_keys:
+            cached = self.market_cache.get(market_key)
+            if cached and cached.get("category"):
+                return cached["category"]
+
+        market = await self._fetch_market_for_trade(trade)
+        category = self._extract_category_from_market(market)
+
+        if category == "Other" and event_slug:
+            event = await self._fetch_event_by_slug(event_slug)
+            category = self._extract_category_from_event(event)
+
+        if category == "Other":
+            category = self._infer_category_from_text(trade.get("title") or "")
+
+        for market_key in market_keys:
+            cached = self.market_cache.get(market_key) or {"resolved": False, "winning_outcome": None}
+            cached["category"] = category
+            self.market_cache[market_key] = cached
+
+        return category
+
+    async def _fetch_market_for_trade(self, trade: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        lookups: List[Dict[str, Any]] = []
+
+        slug = trade.get("slug")
+        if slug:
+            lookups.append({"slug": slug})
+
+        condition_id = trade.get("conditionId") or trade.get("condition_id")
+        if condition_id:
+            lookups.append({"condition_id": condition_id})
+            lookups.append({"conditionId": condition_id})
+
+        market_id = trade.get("marketId") or trade.get("market_id")
+        if market_id:
+            lookups.append({"id": market_id})
+
+        for params in lookups:
+            data = await self._get_json(f"{self.gamma_api_base}/markets", params=params)
+            if isinstance(data, list) and data:
+                return data[0]
+
+        return None
+
+    async def _fetch_event_by_slug(self, event_slug: str) -> Optional[Dict[str, Any]]:
+        data = await self._get_json(f"{self.gamma_api_base}/events", params={"slug": event_slug})
+        if isinstance(data, list) and data:
+            return data[0]
+        return None
+
+    @staticmethod
+    def _extract_category_from_market(market: Optional[Dict[str, Any]]) -> str:
+        if not market:
+            return "Other"
+
+        tags: List[Dict[str, Any]] = []
+        if isinstance(market.get("tags"), list):
+            tags.extend(tag for tag in market.get("tags") if isinstance(tag, dict))
+
+        events = market.get("events") or []
+        if isinstance(events, list) and events:
+            first_event = events[0] if isinstance(events[0], dict) else {}
+            event_tags = first_event.get("tags") or []
+            if isinstance(event_tags, list):
+                tags.extend(tag for tag in event_tags if isinstance(tag, dict))
+
+        preferred_slugs = {
+            "sports": "Sports",
+            "politics": "Politics",
+            "crypto": "Crypto",
+            "business": "Business",
+            "world": "World",
+            "technology": "Technology",
+            "science": "Science",
+            "culture": "Culture",
+            "movies": "Movies",
+            "ai": "AI",
+        }
+
+        for tag in tags:
+            slug = str(tag.get("slug") or "").strip().lower()
+            if slug in preferred_slugs:
+                return preferred_slugs[slug]
+
+        for tag in tags:
+            label = str(tag.get("label") or "").strip()
+            if label:
+                return label
+
+        return "Other"
+
+    @staticmethod
+    def _extract_category_from_event(event: Optional[Dict[str, Any]]) -> str:
+        if not event:
+            return "Other"
+
+        tags = event.get("tags") or []
+        if not isinstance(tags, list):
+            return "Other"
+
+        preferred_slugs = {
+            "sports": "Sports",
+            "politics": "Politics",
+            "crypto": "Crypto",
+            "business": "Business",
+            "world": "World",
+            "technology": "Technology",
+            "science": "Science",
+            "culture": "Culture",
+            "movies": "Movies",
+            "ai": "AI",
+        }
+
+        for tag in tags:
+            if not isinstance(tag, dict):
+                continue
+            slug = str(tag.get("slug") or "").strip().lower()
+            if slug in preferred_slugs:
+                return preferred_slugs[slug]
+
+        for tag in tags:
+            if not isinstance(tag, dict):
+                continue
+            label = str(tag.get("label") or "").strip()
+            if label:
+                return label
+
+        return "Other"
+
+    @staticmethod
+    def _infer_category_from_text(text: str) -> str:
+        value = (text or "").lower()
+        if any(word in value for word in ["vs", "nba", "nfl", "mlb", "soccer", "tennis", "ufc", "nhl", "over/under"]):
+            return "Sports"
+        if any(word in value for word in ["election", "president", "senate", "house", "gop", "democrat", "trump", "biden"]):
+            return "Politics"
+        if any(word in value for word in ["bitcoin", "btc", "ethereum", "eth", "solana", "crypto", "token"]):
+            return "Crypto"
+        if any(word in value for word in ["movie", "film", "oscar", "spirit awards", "actor", "actress"]):
+            return "Movies"
+        if any(word in value for word in ["ai", "openai", "anthropic", "chatgpt", "llm"]):
+            return "AI"
+        return "Other"
+
     async def compute_user_win_rate(self, trades: List[Dict[str, Any]]) -> Optional[float]:
         resolved_count = 0
         winning_count = 0
 
         for trade in trades:
-            slug = trade.get("eventSlug") or trade.get("slug")
+            slug = trade.get("slug") or trade.get("eventSlug")
             if not slug:
                 continue
 
@@ -496,12 +651,7 @@ class PolymarketTopUsersLiveBot:
 
                 seen.add(key)
 
-                slug = trade.get("eventSlug") or trade.get("slug")
-                category = "Unknown"
-                if slug:
-                    market_info = await self.get_market_info(slug)
-                    category = market_info.get("category") or "Unknown"
-
+                category = await self.get_trade_category(trade)
                 tweet = self.format_trade_for_tweet(trade, user, category)
                 generated += 1
 
