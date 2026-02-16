@@ -49,6 +49,8 @@ class PolymarketTopUsersLiveBot:
         self.http_max_attempts = int(os.getenv("V2_HTTP_MAX_ATTEMPTS", "5"))
         self.trade_fetch_concurrency = int(os.getenv("V2_TRADE_FETCH_CONCURRENCY", "1"))
         self.trade_fetch_delay_seconds = float(os.getenv("V2_TRADE_FETCH_DELAY_SECONDS", "0.15"))
+        self.trade_page_size = int(os.getenv("V2_TRADE_PAGE_SIZE", "200"))
+        self.trade_max_pages_per_poll = int(os.getenv("V2_TRADE_MAX_PAGES_PER_POLL", "10"))
 
         self.session: Optional[aiohttp.ClientSession] = None
         self.twitter_client: Optional[TwitterClient] = None
@@ -131,13 +133,82 @@ class PolymarketTopUsersLiveBot:
         data = await self._get_json(f"{self.data_api_base}/v1/leaderboard", params=params)
         return data if isinstance(data, list) else []
 
-    async def get_user_trades(self, wallet: str, limit: int = 500) -> List[Dict[str, Any]]:
-        params = {"user": wallet, "limit": limit}
+    async def get_user_trades(self, wallet: str, limit: int = 500, offset: int = 0) -> List[Dict[str, Any]]:
+        params = {"user": wallet, "limit": limit, "offset": max(0, offset)}
         async with self.trade_fetch_semaphore:
             if self.trade_fetch_delay_seconds > 0:
                 await asyncio.sleep(self.trade_fetch_delay_seconds)
-            data = await self._get_json(f"{self.data_api_base}/trades", params=params)
+            activity_data = await self._get_json(f"{self.data_api_base}/activity", params=params)
+            if isinstance(activity_data, list):
+                return [
+                    item
+                    for item in activity_data
+                    if not item.get("type") or str(item.get("type")).upper() == "TRADE"
+                ]
+
+            legacy_data = await self._get_json(f"{self.data_api_base}/trades", params=params)
+            return legacy_data if isinstance(legacy_data, list) else []
+
+    async def get_user_activity(self, wallet: str, limit: int = 500, offset: int = 0) -> List[Dict[str, Any]]:
+        params = {"user": wallet, "limit": limit, "offset": max(0, offset)}
+        async with self.trade_fetch_semaphore:
+            if self.trade_fetch_delay_seconds > 0:
+                await asyncio.sleep(self.trade_fetch_delay_seconds)
+            data = await self._get_json(f"{self.data_api_base}/activity", params=params)
             return data if isinstance(data, list) else []
+
+    async def _collect_new_trades_for_wallet(self, wallet: str, seen: Set[str]) -> List[Dict[str, Any]]:
+        page_size = max(1, self.trade_page_size)
+        max_pages = max(1, self.trade_max_pages_per_poll)
+
+        offset = 0
+        new_trades: List[Dict[str, Any]] = []
+        new_trade_keys: Set[str] = set()
+
+        for _ in range(max_pages):
+            activity_page = await self.get_user_activity(wallet=wallet, limit=page_size, offset=offset)
+            if activity_page:
+                trades_page = [
+                    item
+                    for item in activity_page
+                    if not item.get("type") or str(item.get("type")).upper() == "TRADE"
+                ]
+                page_item_count = len(activity_page)
+            else:
+                trades_page = await self.get_user_trades(wallet=wallet, limit=page_size, offset=offset)
+                page_item_count = len(trades_page)
+
+            if page_item_count == 0:
+                break
+
+            encountered_seen_trade = False
+
+            for trade in trades_page:
+                key = self._trade_key(trade)
+                if key in seen:
+                    encountered_seen_trade = True
+                    continue
+
+                if key in new_trade_keys:
+                    continue
+
+                new_trade_keys.add(key)
+                new_trades.append(trade)
+
+            if page_item_count < page_size:
+                break
+
+            if encountered_seen_trade:
+                break
+
+            offset += len(trades_page)
+        else:
+            logger.warning(
+                f"Reached V2_TRADE_MAX_PAGES_PER_POLL={max_pages} for {wallet}; "
+                "very high burst activity may still leave older trades for next cycle"
+            )
+
+        return new_trades
 
     async def _post_json(
         self,
@@ -641,8 +712,8 @@ class PolymarketTopUsersLiveBot:
             wallet = user["wallet"]
             seen = self.seen_trade_keys.setdefault(wallet, set())
 
-            trades = await self.get_user_trades(wallet=wallet, limit=200)
-            trades_sorted = sorted(trades, key=lambda t: int(t.get("timestamp", 0)))
+            new_trades = await self._collect_new_trades_for_wallet(wallet=wallet, seen=seen)
+            trades_sorted = sorted(new_trades, key=lambda t: int(t.get("timestamp", 0)))
 
             for trade in trades_sorted:
                 key = self._trade_key(trade)

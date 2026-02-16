@@ -34,6 +34,8 @@ V2_MIN_WIN_RATE=80
 V2_MIN_TRADES_PER_DAY=1
 V2_MAX_TRADES_PER_DAY=25
 V2_TRADE_POLL_SECONDS=60
+V2_TRADE_PAGE_SIZE=200
+V2_TRADE_MAX_PAGES_PER_POLL=10
 V2_DAILY_POLL_SECONDS=86400
 V2_OUTPUT_FILE=test_output.txt
 ```
@@ -49,6 +51,8 @@ python main.py
 - `DRY_RUN=true`: no tweets are posted; output is appended to `V2_OUTPUT_FILE`.
 - `DRY_RUN=false`: tweets are posted through configured Twitter credentials.
 - `V2_RUN_ONCE=true`: run one rebuild + one poll cycle, then exit.
+
+For high-activity wallets, increase coverage per poll using `V2_TRADE_PAGE_SIZE` and `V2_TRADE_MAX_PAGES_PER_POLL`.
 
 ## Notes
 
