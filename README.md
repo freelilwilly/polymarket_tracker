@@ -37,6 +37,7 @@ V2_TRADE_POLL_SECONDS=30
 V2_TRADE_PAGE_SIZE=200
 V2_TRADE_MAX_PAGES_PER_POLL=10
 V2_DAILY_POLL_SECONDS=86400
+V2_ANALYTICS_ROWS_RETRY_SECONDS=15
 V2_OUTPUT_FILE=test_output.txt
 ```
 
@@ -56,5 +57,5 @@ For high-activity wallets, increase coverage per poll using `V2_TRADE_PAGE_SIZE`
 
 ## Notes
 
-- V2 uses Polymarket Analytics as primary candidate source with fallback to Polymarket leaderboard.
+- V2 uses Polymarket Analytics only for candidate selection and retries until rows are returned.
 - The legacy v1 implementation is no longer the default entrypoint.

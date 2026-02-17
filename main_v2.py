@@ -51,6 +51,7 @@ class PolymarketTopUsersLiveBot:
         self.trade_fetch_delay_seconds = float(os.getenv("V2_TRADE_FETCH_DELAY_SECONDS", "0.15"))
         self.trade_page_size = int(os.getenv("V2_TRADE_PAGE_SIZE", "200"))
         self.trade_max_pages_per_poll = int(os.getenv("V2_TRADE_MAX_PAGES_PER_POLL", "10"))
+        self.analytics_rows_retry_seconds = float(os.getenv("V2_ANALYTICS_ROWS_RETRY_SECONDS", "15"))
 
         self.session: Optional[aiohttp.ClientSession] = None
         self.twitter_client: Optional[TwitterClient] = None
@@ -593,29 +594,7 @@ class PolymarketTopUsersLiveBot:
         leaderboard_rows = await self.get_analytics_trader_rows()
 
         if not leaderboard_rows:
-            logger.warning("Polymarket Analytics returned no rows; falling back to data-api WIN_RATE leaderboard")
-            leaderboard_rows = []
-            fetched = 0
-
-            while fetched < self.candidate_limit:
-                batch_limit = min(self.leaderboard_page_size, self.candidate_limit - fetched)
-                batch = await self.get_leaderboard(
-                    limit=batch_limit,
-                    offset=fetched,
-                    time_period="all",
-                    order_by="WIN_RATE",
-                )
-                if not batch:
-                    break
-
-                leaderboard_rows.extend(batch)
-                fetched += len(batch)
-
-                if len(batch) < batch_limit:
-                    break
-
-        if not leaderboard_rows:
-            logger.warning("No leaderboard rows available for candidate selection")
+            logger.warning("Polymarket Analytics returned no rows for top-user selection")
             return []
 
         semaphore = asyncio.Semaphore(3)
@@ -651,6 +630,23 @@ class PolymarketTopUsersLiveBot:
         logger.info("Rebuilding daily top users list")
         selected = await self.select_top_users()
 
+        now = datetime.now(timezone.utc)
+        retry_wait_seconds = int(max(1.0, self.analytics_rows_retry_seconds))
+
+        if not selected:
+            self.next_rebuild_at = now + timedelta(seconds=retry_wait_seconds)
+            if self.selected_users:
+                logger.warning(
+                    "Top-user rebuild returned no rows; keeping prior selection of "
+                    f"{len(self.selected_users)} user(s) and retrying at {self.next_rebuild_at.isoformat()}"
+                )
+            else:
+                logger.warning(
+                    "Top-user rebuild returned no rows and no prior selection exists; "
+                    f"retrying at {self.next_rebuild_at.isoformat()}"
+                )
+            return
+
         self.selected_users = selected
         self.seen_trade_keys = {}
 
@@ -659,7 +655,6 @@ class PolymarketTopUsersLiveBot:
             trades = await self.get_user_trades(wallet=wallet, limit=500)
             self.seen_trade_keys[wallet] = {self._trade_key(trade) for trade in trades}
 
-        now = datetime.now(timezone.utc)
         self.next_rebuild_at = now + timedelta(seconds=self.daily_rebuild_seconds)
 
         lines = [
