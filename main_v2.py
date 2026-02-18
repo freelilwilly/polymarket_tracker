@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional, Set
 import aiohttp
 from dotenv import load_dotenv
 
+from excel_tail_tracker import ExcelTailTracker
 from twitter_client import TwitterClient
 
 load_dotenv()
@@ -52,9 +53,23 @@ class PolymarketTopUsersLiveBot:
         self.trade_page_size = int(os.getenv("V2_TRADE_PAGE_SIZE", "200"))
         self.trade_max_pages_per_poll = int(os.getenv("V2_TRADE_MAX_PAGES_PER_POLL", "10"))
         self.analytics_rows_retry_seconds = float(os.getenv("V2_ANALYTICS_ROWS_RETRY_SECONDS", "15"))
+        self.excel_mode = self._parse_bool(os.getenv("V2_EXCEL_MODE", "false"))
+        self.excel_workbook_path = os.getenv("V2_EXCEL_WORKBOOK", "tail_performance.xlsx")
+        self.tail_starting_bankroll = float(os.getenv("V2_TAIL_STARTING_BANKROLL", "1000"))
+        self.tail_base_risk_pct = float(os.getenv("V2_TAIL_BASE_RISK_PCT", "0.025"))
+        self.tail_min_multiplier = float(os.getenv("V2_TAIL_MIN_MULTIPLIER", "0.9"))
+        self.tail_max_multiplier = float(os.getenv("V2_TAIL_MAX_MULTIPLIER", "1.6"))
+        self.tail_multiplier_curve_power = float(os.getenv("V2_TAIL_MULTIPLIER_CURVE_POWER", "1.35"))
+        self.tail_low_size_threshold_ratio = float(os.getenv("V2_TAIL_LOW_SIZE_THRESHOLD_RATIO", "0.12"))
+        self.tail_low_size_haircut_power = float(os.getenv("V2_TAIL_LOW_SIZE_HAIRCUT_POWER", "0.5"))
+        self.tail_low_size_haircut_min_factor = float(os.getenv("V2_TAIL_LOW_SIZE_HAIRCUT_MIN_FACTOR", "0.35"))
+        self.tail_max_trade_notional_pct = float(os.getenv("V2_TAIL_MAX_TRADE_NOTIONAL_PCT", "0.08"))
+        self.tail_max_market_notional_pct = float(os.getenv("V2_TAIL_MAX_MARKET_NOTIONAL_PCT", "0.25"))
+        self.tail_max_account_notional_pct = float(os.getenv("V2_TAIL_MAX_ACCOUNT_NOTIONAL_PCT", "0.30"))
 
         self.session: Optional[aiohttp.ClientSession] = None
         self.twitter_client: Optional[TwitterClient] = None
+        self.excel_tracker: Optional[ExcelTailTracker] = None
         self.next_rebuild_at: Optional[datetime] = None
 
         self.selected_users: List[Dict[str, Any]] = []
@@ -63,7 +78,7 @@ class PolymarketTopUsersLiveBot:
         self.market_cache: Dict[str, Dict[str, Any]] = {}
         self.trade_fetch_semaphore = asyncio.Semaphore(max(1, self.trade_fetch_concurrency))
 
-        if not self.dry_run:
+        if not self.dry_run and not self.excel_mode:
             self.twitter_client = TwitterClient(
                 api_key=os.getenv("TWITTER_API_KEY"),
                 api_secret=os.getenv("TWITTER_API_SECRET"),
@@ -258,10 +273,14 @@ class PolymarketTopUsersLiveBot:
         if not ranges:
             return []
 
+        candidate_limit = max(1, self.candidate_limit)
+
         payload = {
             "tag": "Overall",
             "sortColumn": "overall_gain",
             "sortDirection": "DESC",
+            "page": 1,
+            "limit": candidate_limit,
             "minPnL": ranges.get("minPnL"),
             "maxPnL": ranges.get("maxPnL"),
             "minActivePositions": ranges.get("minActivePositions"),
@@ -298,7 +317,7 @@ class PolymarketTopUsersLiveBot:
         if not isinstance(rows, list):
             return []
 
-        return rows[: self.candidate_limit]
+        return rows[:candidate_limit]
 
     async def get_user_overall_profit(self, wallet: str) -> float:
         params = {
@@ -654,6 +673,12 @@ class PolymarketTopUsersLiveBot:
             wallet = user["wallet"]
             trades = await self.get_user_trades(wallet=wallet, limit=500)
             self.seen_trade_keys[wallet] = {self._trade_key(trade) for trade in trades}
+            if self.excel_tracker:
+                historical_sizes = [
+                    self._to_float(trade.get("size"), default=0.0) or 0.0
+                    for trade in trades
+                ]
+                self.excel_tracker.set_wallet_size_history(wallet=wallet, observed_sizes=historical_sizes)
 
         self.next_rebuild_at = now + timedelta(seconds=self.daily_rebuild_seconds)
 
@@ -674,7 +699,7 @@ class PolymarketTopUsersLiveBot:
                 f"avgTrades/day={user['avg_trades_per_day']:.2f} | winRate={win_rate_text}"
             )
 
-        lines.extend(["", "Live tweets (new trades only after this rebuild):", ""])
+        lines.extend(["", "Live trades (new trades only after this rebuild):", ""])
         self._write_output(lines, mode="w")
 
     def format_trade_for_tweet(self, trade: Dict[str, Any], user: Dict[str, Any], category: str) -> str:
@@ -721,7 +746,9 @@ class PolymarketTopUsersLiveBot:
                 tweet = self.format_trade_for_tweet(trade, user, category)
                 generated += 1
 
-                if self.dry_run:
+                if self.excel_tracker:
+                    self.excel_tracker.record_trade(trade=trade, user=user, category=category, trade_key=key)
+                elif self.dry_run:
                     block = [
                         f"[{datetime.now(timezone.utc).isoformat()}] {wallet}",
                         tweet,
@@ -733,11 +760,28 @@ class PolymarketTopUsersLiveBot:
                         await self.twitter_client.tweet(tweet)
 
         if generated:
-            logger.info(f"Generated {generated} new tweet(s) from live polling")
+            logger.info(f"Generated {generated} new trade(s) from live polling")
 
     async def start(self):
         await self.initialize()
         try:
+            if self.excel_mode:
+                self.excel_tracker = ExcelTailTracker(
+                    workbook_path=self.excel_workbook_path,
+                    starting_bankroll=self.tail_starting_bankroll,
+                    base_risk_pct=self.tail_base_risk_pct,
+                    min_multiplier=self.tail_min_multiplier,
+                    max_multiplier=self.tail_max_multiplier,
+                    max_trade_notional_pct=self.tail_max_trade_notional_pct,
+                    max_market_notional_pct=self.tail_max_market_notional_pct,
+                    max_account_notional_pct=self.tail_max_account_notional_pct,
+                    multiplier_curve_power=self.tail_multiplier_curve_power,
+                    low_size_threshold_ratio=self.tail_low_size_threshold_ratio,
+                    low_size_haircut_power=self.tail_low_size_haircut_power,
+                    low_size_haircut_min_factor=self.tail_low_size_haircut_min_factor,
+                )
+                logger.info(f"Excel tail tracker enabled: {self.excel_workbook_path}")
+
             await self.rebuild_daily_top_users()
             await self.poll_selected_users_once()
 
