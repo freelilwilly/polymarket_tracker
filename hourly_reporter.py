@@ -37,17 +37,27 @@ def print_report(workbook: str, label: str, warn_roi: float):
 
     ws = wb["Summary"]
 
-    run_start = ws.cell(row=2, column=1).value
-    last_update = ws.cell(row=2, column=2).value
-    start_bankroll = to_float(ws.cell(row=2, column=3).value, 0.0)
-    trades = int(to_float(ws.cell(row=2, column=4).value, 0.0))
-    realized_pnl = to_float(ws.cell(row=2, column=5).value, 0.0)
-    realized_gains = to_float(ws.cell(row=2, column=6).value, 0.0)
-    realized_losses = to_float(ws.cell(row=2, column=7).value, 0.0)
-    unsold_value = to_float(ws.cell(row=2, column=8).value, 0.0)
-    open_notional = to_float(ws.cell(row=2, column=9).value, 0.0)
-    ending_equity = to_float(ws.cell(row=2, column=10).value, 0.0)
-    roi = to_float(ws.cell(row=2, column=11).value, 0.0)
+    headers = [ws.cell(row=1, column=column).value for column in range(1, ws.max_column + 1)]
+    values = [ws.cell(row=2, column=column).value for column in range(1, ws.max_column + 1)]
+    summary = {
+        str(header): value
+        for header, value in zip(headers, values)
+        if header is not None
+    }
+
+    run_start = summary.get("run_start_utc")
+    last_update = summary.get("last_update_utc")
+    start_bankroll = to_float(summary.get("starting_bankroll"), 0.0)
+    trades = int(to_float(summary.get("processed_trades"), 0.0))
+    realized_pnl = to_float(summary.get("realized_pnl"), 0.0)
+    realized_gains = to_float(summary.get("realized_gains"), 0.0)
+    realized_losses = to_float(summary.get("realized_losses"), 0.0)
+    unsold_value = to_float(summary.get("unsold_shares_value"), 0.0)
+    ending_equity = to_float(summary.get("total_equity_est"), 0.0)
+    roi = to_float(summary.get("realized_roi_pct"), 0.0)
+    equity_roi = ((ending_equity - start_bankroll) / start_bankroll) * 100.0 if start_bankroll > 0 else 0.0
+    open_positions = int(to_float(summary.get("open_positions"), 0.0))
+    tracked_accounts = int(to_float(summary.get("tracked_accounts"), 0.0))
 
     print(f"Workbook: {workbook}", flush=True)
     print(f"Run Start: {run_start}", flush=True)
@@ -58,9 +68,11 @@ def print_report(workbook: str, label: str, warn_roi: float):
     print(f"Realized Gains: {realized_gains:.2f}", flush=True)
     print(f"Realized Losses: {realized_losses:.2f}", flush=True)
     print(f"Unsold Value: {unsold_value:.2f}", flush=True)
-    print(f"Open Notional: {open_notional:.2f}", flush=True)
+    print(f"Open Positions: {open_positions}", flush=True)
+    print(f"Tracked Accounts: {tracked_accounts}", flush=True)
     print(f"Ending Equity: {ending_equity:.2f}", flush=True)
-    print(f"ROI: {roi:.2f}%", flush=True)
+    print(f"Realized ROI: {roi:.2f}%", flush=True)
+    print(f"Equity ROI: {equity_roi:.2f}%", flush=True)
 
     if roi <= warn_roi:
         print(f"WARNING: ROI {roi:.2f}% <= {warn_roi:.2f}%", flush=True)

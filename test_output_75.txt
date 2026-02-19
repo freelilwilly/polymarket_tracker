@@ -1,0 +1,20 @@
+Top-user rebuild timestamp (UTC): 2026-02-18T15:34:23.496492+00:00
+Selection filters: Polymarket Analytics trader candidates, numeric win-rate >= 75% when available, avg trades/day in [1, 60], sorted by overall profit
+Selected users: 13
+
+[1] aenews2 (0x44c1dfe43260c94ed4f1d00de2e1f80fb113ebc1) | profit=1832427.75 | avgTrades/day=38.29 | winRate=75.11% (analytics)
+[2] scottilicious (0x000d257d2dc7616feaef4ae0f14600fdf50a758e) | profit=1402581.55 | avgTrades/day=16.14 | winRate=84.66% (analytics)
+[3] Dropper (0x6bab41a0dc40d6dd4c1a915b8c01969479fd1292) | profit=903696.61 | avgTrades/day=44.86 | winRate=78.54% (analytics)
+[4] kcnyekchno (0x7177a7f5c216809c577c50c77b12aae81f81ddef) | profit=806354.72 | avgTrades/day=28.71 | winRate=75.26% (analytics)
+[5] denizz (0xbaa2bcb5439e985ce4ccf815b4700027d1b92c73) | profit=587213.68 | avgTrades/day=44.14 | winRate=75.80% (analytics)
+[6] AgricultureSecretary (0x6ffb4354cbe6e0f9989e3b55564ec5fb8646a834) | profit=422326.17 | avgTrades/day=28.71 | winRate=91.14% (analytics)
+[7] 0x27cdfbea6aacf09f0b4daab6cab1df865fed4d3 (0xf699a6477fa8e385987f8ae6a3657b2e106107e1) | profit=412519.80 | avgTrades/day=23.71 | winRate=80.63% (analytics)
+[8] middleoftheocean (0x6c743aafd813475986dcd930f380a1f50901bd4e) | profit=409184.10 | avgTrades/day=6.29 | winRate=79.82% (analytics)
+[9] 0xe639e41094bbeae18g3e6d1790c17299183f082a (0xe639e41094bbeae18f3e6d1790c17299183f082a) | profit=382109.82 | avgTrades/day=13.00 | winRate=77.03% (analytics)
+[10] piston777 (0x161eb16874e34f545991e774b4e1ac5b65f86ef0) | profit=368464.39 | avgTrades/day=56.71 | winRate=88.78% (analytics)
+[11] ewww1 (0xed61f86bb5298d2f27c21c433ce58d80b88a9aa3) | profit=351266.25 | avgTrades/day=51.71 | winRate=89.31% (analytics)
+[12] Kevindoto (0xcd71fd5370880f3d92bb941e628c05840fe0d127) | profit=350756.35 | avgTrades/day=2.29 | winRate=80.94% (analytics)
+[13] 0x4815162342 (0xa0f8b626bf42c179ccfb8abd67aba00f1363b80d) | profit=303961.27 | avgTrades/day=10.00 | winRate=100.00% (analytics)
+
+Live trades (new trades only after this rebuild):
+

@@ -69,6 +69,22 @@ class ExcelTailTracker:
 
         self.size_history_by_wallet[wallet] = sanitized
 
+    def wallet_has_open_positions(self, wallet: str) -> bool:
+        wallet_prefix = f"{wallet}|"
+        for position_key, position in self.positions.items():
+            if position_key.startswith(wallet_prefix) and position.get("shares", 0.0) > 0:
+                return True
+        return False
+
+    def wallets_with_open_positions(self) -> Set[str]:
+        wallets: Set[str] = set()
+        for position_key, position in self.positions.items():
+            if position.get("shares", 0.0) <= 0:
+                continue
+            wallet = str(position_key).split("|", 1)[0]
+            wallets.add(wallet)
+        return wallets
+
     def _initialize_workbook(self) -> None:
         workbook = Workbook()
         trades = workbook.active
@@ -232,6 +248,15 @@ class ExcelTailTracker:
     def _current_unsold_value(self) -> float:
         return sum(position["shares"] * position["last_price"] for position in self.positions.values())
 
+    def _current_open_cost_basis(self) -> float:
+        return sum(position["shares"] * position["avg_cost"] for position in self.positions.values())
+
+    def _current_unrealized_pnl(self) -> float:
+        return self._current_unsold_value() - self._current_open_cost_basis()
+
+    def _current_free_bankroll(self) -> float:
+        return self.starting_bankroll + self.realized_pnl - self._current_open_cost_basis()
+
     def _save_sheets(self) -> None:
         workbook = load_workbook(self.workbook_path)
 
@@ -244,7 +269,11 @@ class ExcelTailTracker:
         summary.cell(row=2, column=6, value=self.realized_losses)
         summary.cell(row=2, column=7, value=(self.realized_pnl / self.starting_bankroll) * 100.0)
         summary.cell(row=2, column=8, value=self._current_unsold_value())
-        summary.cell(row=2, column=9, value=self.starting_bankroll + self.realized_pnl + self._current_unsold_value())
+        summary.cell(
+            row=2,
+            column=9,
+            value=self.starting_bankroll + self.realized_pnl + self._current_unrealized_pnl(),
+        )
         summary.cell(row=2, column=10, value=len(self.positions))
         summary.cell(row=2, column=11, value=len(self.account_stats))
         summary.cell(row=2, column=12, value=self.processed_trade_count)
@@ -320,6 +349,7 @@ class ExcelTailTracker:
         max_market_open = self.starting_bankroll * self.max_market_notional_pct
         remaining_account = max(0.0, max_account_open - self.account_open_notional.get(wallet, 0.0))
         remaining_market = max(0.0, max_market_open - self.market_open_notional.get(market_key, 0.0))
+        remaining_cash = max(0.0, self._current_free_bankroll())
 
         copied_notional = 0.0
         copied_shares = 0.0
@@ -330,7 +360,7 @@ class ExcelTailTracker:
         account_stats["display_name"] = display_name
 
         if side == "BUY" and observed_price > 0:
-            copied_notional = min(target_notional, per_trade_cap, remaining_account, remaining_market)
+            copied_notional = min(target_notional, per_trade_cap, remaining_account, remaining_market, remaining_cash)
             if copied_notional > 0:
                 copied_shares = copied_notional / observed_price
                 position = self.positions.get(position_key)
@@ -361,8 +391,11 @@ class ExcelTailTracker:
         elif side == "SELL" and observed_price > 0:
             position = self.positions.get(position_key)
             if position and position["shares"] > 0:
-                close_target_notional = min(target_notional, per_trade_cap)
-                close_shares = min(position["shares"], close_target_notional / observed_price)
+                if observed_price >= 1.0 - 1e-9:
+                    close_shares = position["shares"]
+                else:
+                    close_target_notional = min(target_notional, per_trade_cap)
+                    close_shares = min(position["shares"], close_target_notional / observed_price)
                 if close_shares > 0:
                     copied_shares = close_shares
                     copied_notional = close_shares * observed_price
@@ -398,8 +431,9 @@ class ExcelTailTracker:
             account_stats["realized_pnl"] += realized_trade_pnl
 
         unsold_value = self._current_unsold_value()
+        unrealized_pnl = self._current_unrealized_pnl()
         realized_roi_pct = (self.realized_pnl / self.starting_bankroll) * 100.0
-        total_equity_est = self.starting_bankroll + self.realized_pnl + unsold_value
+        total_equity_est = self.starting_bankroll + self.realized_pnl + unrealized_pnl
 
         workbook = load_workbook(self.workbook_path)
         trades = workbook["Trades"]

@@ -54,9 +54,11 @@ class PolymarketTopUsersLiveBot:
         self.trade_max_pages_per_poll = int(os.getenv("V2_TRADE_MAX_PAGES_PER_POLL", "10"))
         self.analytics_rows_retry_seconds = float(os.getenv("V2_ANALYTICS_ROWS_RETRY_SECONDS", "15"))
         self.excel_mode = self._parse_bool(os.getenv("V2_EXCEL_MODE", "false"))
+        self.poll_count_only = self._parse_bool(os.getenv("V2_POLL_COUNT_ONLY", "false"))
+        self.profile_label = os.getenv("V2_PROFILE_LABEL", "")
         self.excel_workbook_path = os.getenv("V2_EXCEL_WORKBOOK", "tail_performance.xlsx")
         self.tail_starting_bankroll = float(os.getenv("V2_TAIL_STARTING_BANKROLL", "1000"))
-        self.tail_base_risk_pct = float(os.getenv("V2_TAIL_BASE_RISK_PCT", "0.025"))
+        self.tail_base_risk_pct = float(os.getenv("V2_TAIL_BASE_RISK_PCT", "0.01"))
         self.tail_min_multiplier = float(os.getenv("V2_TAIL_MIN_MULTIPLIER", "0.9"))
         self.tail_max_multiplier = float(os.getenv("V2_TAIL_MAX_MULTIPLIER", "1.6"))
         self.tail_multiplier_curve_power = float(os.getenv("V2_TAIL_MULTIPLIER_CURVE_POWER", "1.35"))
@@ -73,10 +75,14 @@ class PolymarketTopUsersLiveBot:
         self.next_rebuild_at: Optional[datetime] = None
 
         self.selected_users: List[Dict[str, Any]] = []
+        self.watchlist_users: Dict[str, Dict[str, Any]] = {}
         self.seen_trade_keys: Dict[str, Set[str]] = {}
 
         self.market_cache: Dict[str, Dict[str, Any]] = {}
         self.trade_fetch_semaphore = asyncio.Semaphore(max(1, self.trade_fetch_concurrency))
+
+        if self.poll_count_only:
+            logging.disable(logging.CRITICAL)
 
         if not self.dry_run and not self.excel_mode:
             self.twitter_client = TwitterClient(
@@ -649,6 +655,12 @@ class PolymarketTopUsersLiveBot:
         logger.info("Rebuilding daily top users list")
         selected = await self.select_top_users()
 
+        previous_selected_users = list(self.selected_users)
+        previous_selected_by_wallet = {str(user.get("wallet")): user for user in previous_selected_users if user.get("wallet")}
+        previous_selected_by_wallet.update(
+            {str(user.get("wallet")): user for user in self.watchlist_users.values() if user.get("wallet")}
+        )
+
         now = datetime.now(timezone.utc)
         retry_wait_seconds = int(max(1.0, self.analytics_rows_retry_seconds))
 
@@ -666,14 +678,49 @@ class PolymarketTopUsersLiveBot:
                 )
             return
 
+        new_selected_by_wallet = {str(user.get("wallet")): user for user in selected if user.get("wallet")}
+
+        if self.excel_tracker:
+            previous_selected_wallets = set(previous_selected_by_wallet.keys())
+            new_selected_wallets = set(new_selected_by_wallet.keys())
+            dropped_wallets = previous_selected_wallets - new_selected_wallets
+
+            for wallet in dropped_wallets:
+                if self.excel_tracker.wallet_has_open_positions(wallet):
+                    fallback_user = {
+                        "wallet": wallet,
+                        "display_name": wallet,
+                        "overall_profit": 0.0,
+                        "avg_trades_per_day": 0.0,
+                        "weekly_trade_count": 0,
+                        "win_rate": None,
+                        "win_rate_source": "watchlist",
+                    }
+                    self.watchlist_users[wallet] = previous_selected_by_wallet.get(wallet, fallback_user)
+
+            for wallet in list(self.watchlist_users.keys()):
+                if wallet in new_selected_wallets:
+                    del self.watchlist_users[wallet]
+                    continue
+                if not self.excel_tracker.wallet_has_open_positions(wallet):
+                    del self.watchlist_users[wallet]
+
         self.selected_users = selected
         self.seen_trade_keys = {}
 
+        seed_users: Dict[str, Dict[str, Any]] = {}
         for user in self.selected_users:
+            wallet = str(user.get("wallet"))
+            if wallet:
+                seed_users[wallet] = user
+        for wallet, user in self.watchlist_users.items():
+            seed_users[wallet] = user
+
+        for wallet, user in seed_users.items():
             wallet = user["wallet"]
             trades = await self.get_user_trades(wallet=wallet, limit=500)
             self.seen_trade_keys[wallet] = {self._trade_key(trade) for trade in trades}
-            if self.excel_tracker:
+            if self.excel_tracker and wallet in {str(item.get("wallet")) for item in self.selected_users}:
                 historical_sizes = [
                     self._to_float(trade.get("size"), default=0.0) or 0.0
                     for trade in trades
@@ -686,6 +733,7 @@ class PolymarketTopUsersLiveBot:
             f"Top-user rebuild timestamp (UTC): {now.isoformat()}",
             f"Selection filters: Polymarket Analytics trader candidates, numeric win-rate >= {self.min_win_rate:g}% when available, avg trades/day in [{self.min_trades_per_day:g}, {self.max_trades_per_day:g}], sorted by overall profit",
             f"Selected users: {len(self.selected_users)}",
+            f"Watchlist users (sell-only until flat): {len(self.watchlist_users)}",
             "",
         ]
 
@@ -722,13 +770,24 @@ class PolymarketTopUsersLiveBot:
         )
 
     async def poll_selected_users_once(self):
-        if not self.selected_users:
+        poll_targets: List[Dict[str, Any]] = []
+        for user in self.selected_users:
+            poll_targets.append({"user": user, "sell_only": False})
+        for wallet, user in self.watchlist_users.items():
+            if wallet in {str(item.get("wallet")) for item in self.selected_users}:
+                continue
+            poll_targets.append({"user": user, "sell_only": True})
+
+        if not poll_targets:
             logger.warning("No selected users to poll")
             return
 
         generated = 0
+        watchlist_to_remove: Set[str] = set()
 
-        for user in self.selected_users:
+        for target in poll_targets:
+            user = target["user"]
+            sell_only = bool(target["sell_only"])
             wallet = user["wallet"]
             seen = self.seen_trade_keys.setdefault(wallet, set())
 
@@ -742,12 +801,18 @@ class PolymarketTopUsersLiveBot:
 
                 seen.add(key)
 
+                side = str(trade.get("side") or "").upper()
+                if sell_only and side != "SELL":
+                    continue
+
                 category = await self.get_trade_category(trade)
                 tweet = self.format_trade_for_tweet(trade, user, category)
                 generated += 1
 
                 if self.excel_tracker:
                     self.excel_tracker.record_trade(trade=trade, user=user, category=category, trade_key=key)
+                    if sell_only and not self.excel_tracker.wallet_has_open_positions(wallet):
+                        watchlist_to_remove.add(wallet)
                 elif self.dry_run:
                     block = [
                         f"[{datetime.now(timezone.utc).isoformat()}] {wallet}",
@@ -759,8 +824,19 @@ class PolymarketTopUsersLiveBot:
                     if self.twitter_client:
                         await self.twitter_client.tweet(tweet)
 
+            if self.excel_tracker and sell_only and not self.excel_tracker.wallet_has_open_positions(wallet):
+                watchlist_to_remove.add(wallet)
+
+        for wallet in watchlist_to_remove:
+            self.watchlist_users.pop(wallet, None)
+
         if generated:
-            logger.info(f"Generated {generated} new trade(s) from live polling")
+            if self.poll_count_only:
+                timestamp = datetime.now(timezone.utc).isoformat()
+                label = f"[{self.profile_label}] " if self.profile_label else ""
+                print(f"{timestamp} {label}trades={generated}", flush=True)
+            else:
+                logger.info(f"Generated {generated} new trade(s) from live polling")
 
     async def start(self):
         await self.initialize()
@@ -780,13 +856,15 @@ class PolymarketTopUsersLiveBot:
                     low_size_haircut_power=self.tail_low_size_haircut_power,
                     low_size_haircut_min_factor=self.tail_low_size_haircut_min_factor,
                 )
-                logger.info(f"Excel tail tracker enabled: {self.excel_workbook_path}")
+                if not self.poll_count_only:
+                    logger.info(f"Excel tail tracker enabled: {self.excel_workbook_path}")
 
             await self.rebuild_daily_top_users()
             await self.poll_selected_users_once()
 
             if self.run_once:
-                logger.info("V2_RUN_ONCE enabled. Exiting after first rebuild + poll.")
+                if not self.poll_count_only:
+                    logger.info("V2_RUN_ONCE enabled. Exiting after first rebuild + poll.")
                 return
 
             while True:
