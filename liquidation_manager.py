@@ -95,17 +95,27 @@ class LiquidationManager:
                     order_price = None
 
             # Match only orders at configured liquidation price.
-            if order_price is None or abs(order_price - float(Config.LIQUIDATION_PRICE)) > 0.001:
+            # Use wider tolerance to handle floating point precision and API format variations
+            if order_price is None or abs(order_price - float(Config.LIQUIDATION_PRICE)) > 0.01:
                 continue
 
             outcome = "yes" if intent == "ORDER_INTENT_SELL_LONG" else "no"
+            
+            # Try both slug variants to ensure we match regardless of API format
             candidate_slugs = [market_slug]
             if market_slug.startswith("aec-"):
                 candidate_slugs.append(market_slug[4:])
+            else:
+                candidate_slugs.append(f"aec-{market_slug}")
 
             for candidate_slug in candidate_slugs:
                 position_key = self.position_manager.get_position_key(candidate_slug, outcome)
-                existing_liquidation_by_position.setdefault(position_key, str(order_id))
+                if position_key not in existing_liquidation_by_position:
+                    existing_liquidation_by_position[position_key] = str(order_id)
+                    logger.debug(
+                        f"Found existing liquidation order: {candidate_slug} | {outcome} | "
+                        f"Order ID: {order_id} | Price: ${order_price:.2f}"
+                    )
         
         # Build lookup of active API orders
         api_order_lookup: dict[str, dict[str, Any]] = {}
@@ -228,7 +238,50 @@ class LiquidationManager:
             
             # Create liquidation order if we don't have one
             if position_key not in self.liquidation_orders:
-                await self._create_liquidation_order(market_slug, normalized_outcome, shares)
+                # Double-check: see if there's any existing liquidation order we might have missed
+                # (belt-and-suspenders to prevent duplicate orders)
+                found_existing = False
+                for order in api_orders:
+                    if not isinstance(order, dict):
+                        continue
+                    
+                    order_market = str(order.get("marketSlug") or order.get("market_slug") or "").strip()
+                    order_intent = str(order.get("intent") or "").upper()
+                    
+                    # Check if this order is for our position
+                    expected_intent = "ORDER_INTENT_SELL_LONG" if normalized_outcome == "yes" else "ORDER_INTENT_SELL_SHORT"
+                    if order_intent != expected_intent:
+                        continue
+                    
+                    # Check both slug variants
+                    slug_matches = (
+                        order_market == market_slug or
+                        order_market == f"aec-{market_slug}" or
+                        (order_market.startswith("aec-") and order_market[4:] == market_slug)
+                    )
+                    
+                    if slug_matches:
+                        # Found an existing order for this position
+                        order_price_data = order.get("price")
+                        order_price = None
+                        if isinstance(order_price_data, dict):
+                            try:
+                                order_price = float(order_price_data.get("value"))
+                            except (TypeError, ValueError):
+                                pass
+                        
+                        if order_price and abs(order_price - float(Config.LIQUIDATION_PRICE)) < 0.02:
+                            found_existing = True
+                            order_id = order.get("id") or order.get("orderId") or order.get("order_id")
+                            logger.info(
+                                f"Found existing liquidation order (adoption missed it): {market_slug} | {normalized_outcome} | "
+                                f"Order ID: {order_id} | Price: ${order_price:.2f}"
+                            )
+                            self.liquidation_orders[position_key] = str(order_id)
+                            break
+                
+                if not found_existing:
+                    await self._create_liquidation_order(market_slug, normalized_outcome, shares)
     
     async def _create_liquidation_order(
         self,
@@ -245,10 +298,65 @@ class LiquidationManager:
             shares: Number of shares to sell
         """
         try:
+            # Log the position details before attempting to create the order
+            position_key = self.position_manager.get_position_key(market_slug, outcome)
+            position_data = self.position_manager.positions.get(position_key, {})
+            
+            # CRITICAL PRE-FLIGHT CHECK: Verify account actually has these shares
+            # Get API positions to confirm the shares exist
+            api_positions = await self.api_client.get_positions()
+            api_position_for_market = None
+            if api_positions:
+                for api_pos in api_positions:
+                    api_market = str(api_pos.get("marketSlug") or api_pos.get("market_slug") or "").strip()
+                    api_outcome_raw = str(api_pos.get("outcome") or "").strip()
+                    
+                    # Normalize API market slug (remove aec- prefix)
+                    if api_market.startswith("aec-"):
+                        api_market = api_market[4:]
+                    
+                    # CRITICAL: Normalize the API outcome to yes/no for comparison
+                    # The API returns team names like "Fighting Illini" but we store as "yes/no"
+                    api_outcome_normalized = api_outcome_raw.lower()
+                    if api_outcome_normalized not in ("yes", "no"):
+                        # Try to normalize team name to yes/no
+                        normalized = await self.api_client.normalize_outcome_to_yes_no(api_market, api_outcome_raw)
+                        if normalized:
+                            api_outcome_normalized = normalized
+                    
+                    # Match by market AND outcome (comparing normalized outcomes)
+                    if api_market == market_slug and api_outcome_normalized == outcome.lower():
+                        api_position_for_market = api_pos
+                        break
+            
+            api_shares = 0.0
+            if api_position_for_market:
+                try:
+                    api_shares = abs(float(api_position_for_market.get("size") or 0))
+                except (TypeError, ValueError):
+                    pass
+            
             logger.info(
                 f"Creating liquidation order: {market_slug} | {outcome} | "
-                f"{shares:.2f} shares @ ${Config.LIQUIDATION_PRICE}"
+                f"Attempting {shares:.2f} shares @ ${Config.LIQUIDATION_PRICE} | "
+                f"Local position: {position_data.get('shares', 'N/A')} shares @ "
+                f"${position_data.get('avg_price', 'N/A')} | "
+                f"API has: {api_shares:.2f} shares"
             )
+            
+            # If API has no shares or fewer shares than we're trying to sell, warn
+            if api_shares < 0.01:
+                logger.error(
+                    f"ABORTING liquidation order: API reports {api_shares:.2f} shares but trying to sell {shares:.2f}. "
+                    f"Position tracking may be out of sync!"
+                )
+                return
+            elif api_shares < shares - 0.01:
+                logger.warning(
+                    f"API has fewer shares ({api_shares:.2f}) than position tracking ({shares:.2f}). "
+                    f"Adjusting order to match API balance."
+                )
+                shares = api_shares
             
             result = await self.api_client.place_order(
                 market_slug=market_slug,
@@ -272,7 +380,8 @@ class LiquidationManager:
                     logger.warning(f"Liquidation order created but no order ID returned")
             else:
                 logger.warning(
-                    f"Failed to create liquidation order: {market_slug} | {outcome}"
+                    f"Failed to create liquidation order: {market_slug} | {outcome} | "
+                    f"API returned None (check logs for errors)"
                 )
         
         except Exception as e:

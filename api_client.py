@@ -277,9 +277,16 @@ class PolymarketAPIClient:
                         await asyncio.sleep(wait_time)
                         continue
 
-                    logger.warning(
-                        f"Request failed: POST {url} -> {response.status}: {text}"
-                    )
+                    # Suppress "market not found" warnings - these are handled by slug retry logic in place_order
+                    is_market_not_found = "market not found" in text.lower()
+                    if not is_market_not_found:
+                        logger.warning(
+                            f"Request failed: POST {url} -> {response.status}: {text}"
+                        )
+                    else:
+                        logger.debug(
+                            f"Market not found (will retry with different slug): POST {url} -> {response.status}: {text}"
+                        )
                     return None, last_error
 
             except asyncio.TimeoutError:
@@ -435,69 +442,52 @@ class PolymarketAPIClient:
         Returns:
             Market info dict or None
         """
-        def _build_candidate_slugs(slug: str) -> list[str]:
-            candidates: list[str] = []
-
-            def _add(value: str) -> None:
-                normalized = str(value or "").strip()
-                if normalized and normalized not in candidates:
-                    candidates.append(normalized)
-
-            _add(slug)
-            base_slug = slug[4:] if slug.startswith("aec-") else slug
-            _add(base_slug)
-
-            # Heuristic variant generation for some US aec abbreviations that
-            # differ from Gamma slug team codes (e.g., nba-sa-... -> nba-sas-...).
-            parts = base_slug.split("-")
-            date_idx = None
-            for idx, token in enumerate(parts):
-                if len(token) == 4 and token.isdigit():
-                    date_idx = idx
-                    break
-
-            if date_idx is not None and date_idx > 1:
-                pre_date = parts[:date_idx]
-                post_date = parts[date_idx:]
-                for i in range(1, len(pre_date)):
-                    token = pre_date[i]
-                    if len(token) == 2 and token.isalpha():
-                        variant = pre_date.copy()
-                        variant[i] = f"{token}s"
-                        _add("-".join(variant + post_date))
-
-            return candidates
-
-        candidate_slugs = _build_candidate_slugs(market_slug)
-
-        data: Optional[dict[str, Any]] = None
-        url = f"{self.gamma_api_base}/markets"
-        for slug in candidate_slugs:
-            response = await self._get_json(url, params={"slug": slug, "limit": 1})
-            if isinstance(response, list) and response:
-                first = response[0]
-                if isinstance(first, dict):
-                    data = first
-                    break
-            if isinstance(response, dict):
-                payload = response.get("data")
+        # Always try both aec-<slug> and <slug> for US markets
+        # Use query parameter instead of path parameter to avoid validation errors
+        candidate_slugs = [market_slug]
+        if market_slug.startswith("aec-"):
+            # If slug already has aec- prefix, also try without it
+            candidate_slugs.append(market_slug[4:])  # Remove "aec-" prefix
+        else:
+            # If slug doesn't have prefix, also try with it
+            candidate_slugs.append(f"aec-{market_slug}")
+        
+        data = None
+        for candidate_slug in candidate_slugs:
+            # Use query parameter ?slug= instead of path /markets/{slug}
+            # Path parameter validates as UUID/ID, query parameter searches by slug
+            url = f"{self.gamma_api_base}/markets"
+            params = {"slug": candidate_slug}
+            payload = await self._get_json(url, params=params)
+            
+            if payload:
+                # Gamma API returns a list when using query parameters
                 if isinstance(payload, list) and payload:
+                    # Take first result (should only be one matching slug)
                     first = payload[0]
                     if isinstance(first, dict):
                         data = first
                         break
+                elif isinstance(payload, dict):
+                    data = payload
+                    break
 
         if not data:
+            logger.warning(
+                f"Market not found in Gamma API: original={market_slug}, "
+                f"tried={candidate_slugs}"
+            )
             return None
         
-        # Parse clobTokenIds and outcomes from JSON strings to create tokens array
+        # Parse outcomes and token IDs from JSON strings to create tokens array
         try:
-            clob_token_ids_str = data.get("clobTokenIds", "[]")
+            # Gamma API returns both outcomes and clobTokenIds as JSON strings
             outcomes_str = data.get("outcomes", "[]")
+            clob_token_ids_str = data.get("clobTokenIds", "[]")
             
             # Parse JSON arrays
-            token_ids = json.loads(clob_token_ids_str) if isinstance(clob_token_ids_str, str) else clob_token_ids_str
             outcomes = json.loads(outcomes_str) if isinstance(outcomes_str, str) else outcomes_str
+            token_ids = json.loads(clob_token_ids_str) if isinstance(clob_token_ids_str, str) else clob_token_ids_str
             
             # Create tokens array
             if isinstance(token_ids, list) and isinstance(outcomes, list) and len(token_ids) == len(outcomes):
@@ -506,7 +496,7 @@ class PolymarketAPIClient:
                     for tid, outcome in zip(token_ids, outcomes)
                 ]
             else:
-                logger.warning(f"Could not parse tokens for {market_slug}")
+                logger.warning(f"Could not parse tokens for {market_slug}: token_ids={token_ids}, outcomes={outcomes}")
                 data["tokens"] = []
         except Exception as e:
             logger.warning(f"Error parsing tokens for {market_slug}: {e}")
@@ -571,41 +561,63 @@ class PolymarketAPIClient:
         Args:
             market_slug: Market slug
             side: "buy" or "sell"
-            outcome: Outcome (default: "yes")
+            outcome: Outcome to get price for
             
         Returns:
-            Best price or None
+            Best price as float or None
         """
-        book = await self.get_order_book(market_slug, outcome)
-        if not book:
+        # get_market_info already handles aec- prefix logic, so just call it directly
+        market_info = await self.get_market_info(market_slug)
+        if not market_info:
+            logger.warning(f"Cannot get market info for {market_slug}")
             return None
         
+        tokens = market_info.get("tokens", [])
+        if not tokens:
+            logger.warning(f"No tokens found for {market_slug}")
+            return None
+        
+        resolved_index = resolve_outcome_index(outcome, tokens)
+        if resolved_index is None:
+            logger.warning(f"Outcome '{outcome}' not resolvable for {market_slug}")
+            return None
+        
+        token = tokens[resolved_index]
+        token_id = token.get("token_id") or token.get("tokenId")
+        
+        if not token_id:
+            logger.warning(f"Cannot extract token_id for {market_slug}")
+            return None
+        
+        # Get order book from CLOB API
+        url = f"{self.clob_api_base}/book"
+        params = {"token_id": token_id}
+        data = await self._get_json(url, params=params)
+        
+        if not isinstance(data, dict):
+            logger.warning(f"No order book data for {market_slug}")
+            return None
+        
+        # Extract best price from order book
         try:
-            def _extract_prices(levels: list[dict[str, Any]]) -> list[float]:
-                prices: list[float] = []
-                for level in levels:
-                    if not isinstance(level, dict):
-                        continue
-                    p = to_float(level.get("price"), default=-1.0)
-                    if 0.0 <= p <= 1.0:
-                        prices.append(p)
-                return prices
-
-            if side.lower() == "buy":
-                # For buying, we want the best ask (lowest available ask).
-                asks = book.get("asks", [])
-                prices = _extract_prices(asks if isinstance(asks, list) else [])
-                if prices:
-                    return min(prices)
+            side_lower = side.lower()
+            if side_lower == "buy":
+                asks = data.get("asks", [])
+                if asks and isinstance(asks, list):
+                    prices = [float(ask.get("price", 0)) for ask in asks if ask.get("price")]
+                    if prices:
+                        return min(prices)
             else:
-                # For selling, we want the best bid (highest available bid).
-                bids = book.get("bids", [])
-                prices = _extract_prices(bids if isinstance(bids, list) else [])
-                if prices:
-                    return max(prices)
+                bids = data.get("bids", [])
+                if bids and isinstance(bids, list):
+                    prices = [float(bid.get("price", 0)) for bid in bids if bid.get("price")]
+                    if prices:
+                        return max(prices)
         except Exception as e:
             logger.warning(f"Error extracting price from orderbook: {e}")
+            return None
         
+        logger.warning(f"No valid prices in order book for {market_slug}")
         return None
     
     # ==================== US Trading API Methods (Authentication Required) ====================
@@ -676,6 +688,10 @@ class PolymarketAPIClient:
         url = f"{self.us_api_base}/v1/portfolio/positions"
         data = await self._get_json(url, auth_required=True)
 
+        if not data:
+            logger.warning("get_positions() received None from API")
+            return None
+
         if data and isinstance(data, dict):
             positions = data.get("positions", [])
 
@@ -704,7 +720,14 @@ class PolymarketAPIClient:
                         qty_bought = to_float(payload.get("qtyBought"), default=0.0)
                         long_size = qty_bought if qty_bought > 0 else 0.0
 
+                # DEBUG: Log why positions are being filtered
                 if long_size <= 0:
+                    logger.warning(
+                        f"FILTERING OUT POSITION (long_size={long_size:.2f}): market={market_slug}, "
+                        f"qtyAvailable={payload.get('qtyAvailable')}, size={payload.get('size')}, "
+                        f"netPosition={payload.get('netPosition')}, qtyBought={payload.get('qtyBought')}, "
+                        f"outcome={outcome}"
+                    )
                     return None
 
                 return {
@@ -776,65 +799,95 @@ class PolymarketAPIClient:
                 )
                 return None
             outcome_lower = normalized
-        
-        # Determine order intent based on outcome and side
+
         side_upper = side.upper()
-        
-        # ORDER_INTENT_BUY_LONG: Buy YES tokens (index 0) - creates LONG YES position
-        # ORDER_INTENT_BUY_SHORT: Buy NO tokens (index 1) - creates LONG NO position (NOT a leveraged short!)
-        # Note: Despite the confusing name "BUY_SHORT", this is NOT a short position.
-        # It's a regular LONG position on the NO-side outcome.
-        if side_upper == "BUY":
-            if outcome_lower == "yes":
-                order_intent = "ORDER_INTENT_BUY_LONG"  # Buy YES
-            else:
-                order_intent = "ORDER_INTENT_BUY_SHORT"  # Buy NO (LONG position on NO)
-        else:
-            # SELL reduces existing position regardless of which side (YES or NO)
-            if outcome_lower == "yes":
-                order_intent = "ORDER_INTENT_SELL_LONG"  # Sell YES
-            else:
-                order_intent = "ORDER_INTENT_SELL_SHORT"  # Sell NO
-        
-        # US API requires YES-basis pricing for both BUY_SHORT and SELL_SHORT intents.
-        if outcome_lower == "no":
-            price = max(0.01, min(0.99, 1.0 - price))
-        else:
-            price = max(0.01, min(0.99, price))
 
-        shares = max(0.0, float(shares))
-        if side_upper == "SELL":
-            # Never round up sells; rounding up can exceed holdings and create
-            # unintended opposite exposure on some venues.
-            quantity = int(shares)
+        # Always try both aec-<slug> and <slug> for US API
+        candidate_slugs = [market_slug]
+        if market_slug.startswith("aec-"):
+            # If slug already has aec- prefix, also try without it
+            candidate_slugs.append(market_slug[4:])  # Remove "aec-" prefix
         else:
-            quantity = int(round(shares))
+            # If slug doesn't have prefix, also try with it
+            candidate_slugs.append(f"aec-{market_slug}")
 
-        if quantity <= 0:
+        last_market_not_found_error = None
+        for candidate_slug in candidate_slugs:
+            # ORDER_INTENT_BUY_LONG: Buy YES tokens (index 0) - creates LONG YES position
+            # ORDER_INTENT_BUY_SHORT: Buy NO tokens (index 1) - creates LONG NO position (NOT a leveraged short!)
+            if side_upper == "BUY":
+                if outcome_lower == "yes":
+                    order_intent = "ORDER_INTENT_BUY_LONG"
+                else:
+                    order_intent = "ORDER_INTENT_BUY_SHORT"
+            else:
+                if outcome_lower == "yes":
+                    order_intent = "ORDER_INTENT_SELL_LONG"
+                else:
+                    order_intent = "ORDER_INTENT_SELL_SHORT"
+
+            if outcome_lower == "no":
+                adj_price = max(0.01, min(0.99, 1.0 - price))
+            else:
+                adj_price = max(0.01, min(0.99, price))
+
+            shares_val = max(0.0, float(shares))
+            if side_upper == "SELL":
+                quantity = int(shares_val)
+            else:
+                quantity = int(round(shares_val))
+
+            if quantity <= 0:
+                logger.warning(
+                    f"Refusing to place {side_upper} with non-positive quantity: shares={shares_val:.6f}"
+                )
+                return None
+
+            order_data = {
+                "marketSlug": candidate_slug,
+                "type": order_type,
+                "price": {"value": f"{adj_price:.2f}", "currency": "USD"},
+                "quantity": quantity,
+                "tif": tif,
+                "intent": order_intent,
+                "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
+                "participateDontInitiate": False,
+            }
+
+            result, order_error = await self._post_json_with_meta(url, order_data, auth_required=True)
+            if order_error:
+                self.last_order_error = order_error
+            if result and isinstance(result, dict):
+                # Check for error or rejected status in the response
+                status = result.get("status") or result.get("orderStatus")
+                error_msg = result.get("error") or result.get("errorMessage") or result.get("message")
+                
+                # If there's an error message in the response, treat as failure
+                if error_msg and ("error" in str(error_msg).lower() or "reject" in str(error_msg).lower()):
+                    logger.warning(
+                        f"Order rejected: {market_slug} | {outcome} | {side} | "
+                        f"{shares} @ ${price:.2f} - Error: {error_msg}"
+                    )
+                    return None
+                
+                # Log full response for debugging
+                order_id = result.get("orderId") or result.get("order_id") or result.get("id")
+                if order_id:
+                    # Log the full result to see what the API actually returned
+                    logger.debug(f"Order placed - Full API response: {result}")
+                    return {"order_id": order_id, "result": result}
+            # If market not found, try next candidate
+            if order_error and "market not found" in str(order_error.get("message", "")).lower():
+                last_market_not_found_error = order_error
+                continue
+            # For other errors, break
+            break
+        
+        # If all candidates failed with "market not found", log warning
+        if last_market_not_found_error:
             logger.warning(
-                f"Refusing to place {side_upper} with non-positive quantity: shares={shares:.6f}"
+                f"Market not available on US API (tried {candidate_slugs}): {market_slug}"
             )
-            return None
-        
-        order_data = {
-            "marketSlug": market_slug,
-            "type": order_type,
-            "price": {"value": f"{price:.2f}", "currency": "USD"},
-            "quantity": quantity,
-            "tif": tif,
-            "intent": order_intent,
-            "manualOrderIndicator": "MANUAL_ORDER_INDICATOR_AUTOMATIC",
-            "participateDontInitiate": False,
-        }
-        
-        result, order_error = await self._post_json_with_meta(url, order_data, auth_required=True)
-        if order_error:
-            self.last_order_error = order_error
-        
-        if result and isinstance(result, dict):
-            order_id = result.get("orderId") or result.get("order_id") or result.get("id")
-            if order_id:
-                return {"order_id": order_id, "result": result}
         
         return None
     
@@ -850,7 +903,6 @@ class PolymarketAPIClient:
             True if successful, False otherwise
         """
         url = f"{self.us_api_base}/v1/order/{order_id}/cancel"
-        payload: dict[str, Any] = {}
 
         slug = str(market_slug or "").strip()
         if not slug:
@@ -858,14 +910,30 @@ class PolymarketAPIClient:
             if isinstance(details, dict):
                 slug = str(details.get("marketSlug") or details.get("market_slug") or "").strip()
 
-        if slug:
-            payload["marketSlug"] = slug
+        if not slug:
+            # Try without market slug in payload
+            result = await self._post_json(url, {}, auth_required=True)
+            return result is not None
 
-        result = await self._post_json(url, payload, auth_required=True)
+        # Always try both aec-<slug> and <slug> for US API
+        candidate_slugs = [slug]
+        if slug.startswith("aec-"):
+            # If slug already has aec- prefix, also try without it
+            candidate_slugs.append(slug[4:])  # Remove "aec-" prefix
+        else:
+            # If slug doesn't have prefix, also try with it
+            candidate_slugs.append(f"aec-{slug}")
 
-        # US API may return an empty JSON object on successful cancel.
-        # Treat any non-None response as success.
-        return result is not None
+        for candidate_slug in candidate_slugs:
+            payload: dict[str, Any] = {"marketSlug": candidate_slug}
+            result = await self._post_json(url, payload, auth_required=True)
+            
+            # US API may return an empty JSON object on successful cancel.
+            if result is not None:
+                return True
+        
+        # All candidates failed
+        return False
     
     async def get_orders(self) -> Optional[list[dict[str, Any]]]:
         """
@@ -909,16 +977,7 @@ class PolymarketAPIClient:
         strict: bool = False,
         allow_fuzzy: Optional[bool] = None,
     ) -> Optional[str]:
-        """
-        Normalize arbitrary outcome text to 'yes' or 'no' for binary markets.
-        
-        Args:
-            market_slug: Market slug
-            outcome: Outcome text to normalize
-            
-        Returns:
-            'yes' or 'no' if resolved, None otherwise
-        """
+        # Docstring removed to fix unterminated triple-quoted string error
         from utils import normalize_outcome_to_yes_no
         return await normalize_outcome_to_yes_no(
             self,
@@ -928,3 +987,4 @@ class PolymarketAPIClient:
             strict=strict,
             allow_fuzzy=allow_fuzzy,
         )
+

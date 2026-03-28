@@ -257,15 +257,25 @@ class LiveTradingBot:
             try:
                 balance = self.position_manager.balance
                 if balance is not None:
+                    # CRITICAL: Sync with API first to ensure accurate position count
+                    # This prevents showing stale cached position data in account status
+                    await self.position_manager.sync_positions_with_api()
+                    
                     summary = self.position_manager.get_summary()
                     cash = summary.get("buying_power")
                     if cash is None:
                         cash = max(0.0, balance - summary["total_invested"])
-                    positions_value = max(0.0, balance - cash)
+                    
+                    # Calculate actual position value from current market prices (already uses fresh API data)
+                    positions_value = await self.position_manager.get_total_positions_value()
+                    
+                    # Total equity should be cash + positions
+                    total_equity = cash + positions_value
+                    
                     logger.info(
                         f"Account: cash=${cash:.2f} | "
                         f"positions=${positions_value:.2f} | "
-                        f"equity=${balance:.2f} | "
+                        f"equity=${total_equity:.2f} | "
                         f"{summary['total_positions']} open"
                     )
             except Exception as e:
@@ -302,11 +312,6 @@ class LiveTradingBot:
             if not is_sports_market(market_slug):
                 logger.debug(f"Skipping non-sports market: {market_slug}")
                 return
-            
-            logger.info(
-                f"Processing trade: {market_slug} | {outcome.upper()} | {side.upper()} | "
-                f"Trader: {trader_wallet[:8]}..."
-            )
             
             # Handle based on side
             if side_upper == "BUY":
@@ -351,7 +356,7 @@ class LiveTradingBot:
         """
         if observed_price is not None and observed_price > 0:
             if observed_price < Config.MIN_BUY_PRICE or observed_price > Config.MAX_BUY_PRICE:
-                logger.info(
+                logger.debug(
                     f"Skipping copied BUY outside configured range: {market_slug} | {outcome} | "
                     f"observed=${observed_price:.4f} not in "
                     f"${Config.MIN_BUY_PRICE:.2f}-${Config.MAX_BUY_PRICE:.2f}"
@@ -391,7 +396,7 @@ class LiveTradingBot:
             return
 
         if current_buy_price < Config.MIN_BUY_PRICE or current_buy_price > Config.MAX_BUY_PRICE:
-            logger.info(
+            logger.debug(
                 f"Price ${current_buy_price:.4f} out of range "
                 f"(${Config.MIN_BUY_PRICE:.2f}-${Config.MAX_BUY_PRICE:.2f}), skipping"
             )
@@ -431,6 +436,11 @@ class LiveTradingBot:
 
         target_shares = investment_amount / current_buy_price
         effective_observed_price = observed_price if (observed_price and observed_price > 0) else current_buy_price
+
+        logger.info(
+            f"Processing BUY: {market_slug} | {outcome.upper()} | "
+            f"Trader: {trader_wallet[:8]}... | ${effective_observed_price:.4f}"
+        )
 
         result = await self.trade_executor.execute_buy(
             market_slug=market_slug,
@@ -528,6 +538,11 @@ class LiveTradingBot:
         # Cancel liquidation order if exists
         if Config.ENABLE_AUTO_LIQUIDATION:
             await self.liquidation_manager.cancel_liquidation_order(market_slug, normalized_outcome)
+        
+        logger.info(
+            f"Processing SELL: {market_slug} | {outcome.upper()} | "
+            f"Trader: {trader_wallet[:8] if trader_wallet else 'N/A'}... | {shares_to_sell:.2f} shares"
+        )
         
         # Execute sell
         result = await self.trade_executor.execute_sell(
