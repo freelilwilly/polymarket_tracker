@@ -7,6 +7,7 @@ import asyncio
 import logging
 import sys
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 from api_client import PolymarketAPIClient
 from config import Config
@@ -65,6 +66,8 @@ class LiveTradingBot:
         self._last_trader_refresh: datetime | None = None
         self._us_untradable_until: dict[str, datetime] = {}
         self._us_untradable_reasons: dict[str, list[str]] = {}
+        self._pending_buy_orders: dict[str, dict[str, Any]] = {}
+        self._trader_display_names: dict[str, str] = {}
 
     def _is_us_market_temporarily_untradable(self, market_slug: str) -> bool:
         expires_at = self._us_untradable_until.get(market_slug)
@@ -102,6 +105,183 @@ class LiveTradingBot:
             self._us_untradable_reasons.pop(market_slug, None)
             logger.info(f"Removed US-untradable cache for market: {market_slug}")
 
+    @staticmethod
+    def _normalize_market_slug(slug: str) -> str:
+        value = str(slug or "").strip().lower()
+        if value.startswith("aec-"):
+            return value[4:]
+        return value
+
+    @staticmethod
+    def _short_wallet(wallet: str | None) -> str:
+        value = str(wallet or "").strip().lower()
+        if not value:
+            return "UNKNOWN_TRADER"
+        return f"{value[:8]}..."
+
+    def _trader_label(self, wallet: str | None) -> str:
+        value = str(wallet or "").strip().lower()
+        if not value:
+            return "UNKNOWN_TRADER"
+        label = str(self._trader_display_names.get(value) or "").strip()
+        return label or self._short_wallet(value)
+
+    async def _get_copied_position_shares(
+        self,
+        trader_wallet: str,
+        market_slug: str,
+        normalized_outcome: str,
+    ) -> float | None:
+        """Fetch copied trader's current position shares for the target market/outcome."""
+        positions = await self.api_client.get_user_positions(
+            wallet=trader_wallet,
+            limit=Config.TRADE_PAGE_SIZE,
+        )
+        if not positions:
+            return None
+
+        target_slug = self._normalize_market_slug(market_slug)
+        target_outcome = str(normalized_outcome or "").strip().lower()
+        total_shares = 0.0
+        matched = False
+
+        for pos in positions:
+            if not isinstance(pos, dict):
+                continue
+
+            pos_slug = self._normalize_market_slug(
+                str(pos.get("slug") or pos.get("marketSlug") or pos.get("market_slug") or "")
+            )
+            if not pos_slug or pos_slug != target_slug:
+                continue
+
+            pos_outcome_raw = str(pos.get("outcome") or "").strip()
+            if not pos_outcome_raw:
+                continue
+
+            pos_outcome = pos_outcome_raw.lower()
+            if pos_outcome not in ("yes", "no"):
+                normalized = await self.api_client.normalize_outcome_to_yes_no(market_slug, pos_outcome_raw)
+                if normalized:
+                    pos_outcome = normalized.lower()
+
+            if pos_outcome != target_outcome:
+                continue
+
+            matched = True
+            total_shares += max(0.0, to_float(pos.get("size"), default=0.0))
+
+        if not matched:
+            return 0.0
+
+        return max(0.0, total_shares)
+
+    @staticmethod
+    def _parse_order_execution(details: dict[str, Any] | None) -> tuple[str, float, float]:
+        payload = details if isinstance(details, dict) else {}
+        state = str(
+            payload.get("state") or payload.get("status") or payload.get("orderState") or ""
+        ).upper()
+
+        cum_data = (
+            payload.get("cumQuantity")
+            or payload.get("cumQty")
+            or payload.get("filledQuantity")
+            or payload.get("executedQuantity")
+            or 0
+        )
+        if isinstance(cum_data, dict):
+            cum_qty = to_float(cum_data.get("value"), default=0.0)
+        else:
+            cum_qty = to_float(cum_data, default=0.0)
+
+        avg_data = payload.get("avgPx") or payload.get("avgPrice") or payload.get("averagePrice") or 0
+        if isinstance(avg_data, dict):
+            avg_px = to_float(avg_data.get("value"), default=0.0)
+        else:
+            avg_px = to_float(avg_data, default=0.0)
+
+        return state, max(0.0, cum_qty), max(0.0, avg_px)
+
+    def _track_pending_buy(self, order_id: str, record: dict[str, Any]):
+        self._pending_buy_orders[str(order_id)] = {
+            **record,
+            "created_at": datetime.now(timezone.utc),
+            "next_check_at": datetime.now(timezone.utc),
+            "checks": 0,
+        }
+
+    async def _reconcile_pending_buys(self):
+        if not self._pending_buy_orders:
+            return
+
+        now = datetime.now(timezone.utc)
+        terminal_states = {
+            "ORDER_STATE_CANCELLED",
+            "CANCELLED",
+            "CANCELED",
+            "ORDER_STATE_EXPIRED",
+            "EXPIRED",
+            "ORDER_STATE_REJECTED",
+            "REJECTED",
+        }
+
+        for order_id, record in list(self._pending_buy_orders.items()):
+            next_check_at = record.get("next_check_at")
+            if isinstance(next_check_at, datetime) and now < next_check_at:
+                continue
+
+            created_at = record.get("created_at") if isinstance(record.get("created_at"), datetime) else now
+            age_seconds = (now - created_at).total_seconds()
+            if age_seconds > max(30, Config.BUY_PENDING_RECONCILE_SECONDS):
+                logger.warning(
+                    f"Pending BUY reconciliation timeout: {record.get('market_slug')} | {record.get('outcome')} | "
+                    f"order_id={order_id}"
+                )
+                self._pending_buy_orders.pop(order_id, None)
+                continue
+
+            details = await self.api_client.get_order_details(order_id)
+            state, cum_qty, avg_px = self._parse_order_execution(details)
+
+            market_slug = str(record.get("market_slug") or "")
+            outcome = str(record.get("outcome") or "")
+            trader_wallet = str(record.get("trader_wallet") or "")
+
+            if cum_qty > 0:
+                position = self.position_manager.get_position(market_slug, outcome)
+                if position:
+                    if not str(position.get("monitored_trader") or "").strip() and trader_wallet:
+                        self.position_manager.set_position_monitored_trader(market_slug, outcome, trader_wallet)
+                else:
+                    fill_price = avg_px if avg_px > 0 else to_float(record.get("current_price"), default=0.0)
+                    self.position_manager.open_position(
+                        market_slug=market_slug,
+                        outcome=outcome,
+                        shares=cum_qty,
+                        price=fill_price if fill_price > 0 else max(0.01, to_float(record.get("current_price"), default=0.5)),
+                        monitored_trader=trader_wallet or None,
+                    )
+
+                logger.info(
+                    f"Reconciled pending BUY as filled: {market_slug} | {outcome} | "
+                    f"shares={cum_qty:.2f} | order_id={order_id}"
+                )
+                self._pending_buy_orders.pop(order_id, None)
+                continue
+
+            if state in terminal_states:
+                logger.warning(
+                    f"Pending BUY closed without fill: {market_slug} | {outcome} | order_id={order_id} | state={state}"
+                )
+                self._pending_buy_orders.pop(order_id, None)
+                continue
+
+            checks = int(record.get("checks") or 0) + 1
+            record["checks"] = checks
+            record["next_check_at"] = now + timedelta(seconds=max(5, Config.BUY_PENDING_RECHECK_SECONDS))
+            self._pending_buy_orders[order_id] = record
+
     async def _refresh_selected_traders(self):
         """Refresh monitored traders and warm up monitor state."""
         logger.info("Refreshing selected traders...")
@@ -117,6 +297,13 @@ class LiveTradingBot:
             wallet = trader.get("wallet")
             if not wallet:
                 continue
+
+            wallet_key = str(wallet).strip().lower()
+            display_name = str(trader.get("display_name") or "").strip()
+            if wallet_key and display_name:
+                self._trader_display_names[wallet_key] = display_name
+                self.trade_monitor.set_wallet_label(wallet_key, display_name)
+
             historical = await self.api_client.get_user_trades(wallet=wallet, limit=Config.TRADE_PAGE_SIZE)
             self.trade_monitor.initialize_wallet(wallet, historical)
     
@@ -224,7 +411,7 @@ class LiveTradingBot:
         if not trades:
             return
 
-        logger.info(f"Found {len(trades)} new trade(s) from {wallet[:8]}...")
+        logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)}")
         for trade in trades:
             await self._process_trade(trade, wallet)
 
@@ -264,6 +451,7 @@ class LiveTradingBot:
         """Slower personal-account maintenance loop."""
         while self.running:
             try:
+                await self._reconcile_pending_buys()
                 await self.position_manager.sync_positions_with_api()
 
                 if Config.ENABLE_AUTO_LIQUIDATION:
@@ -407,15 +595,6 @@ class LiveTradingBot:
             outcome: Outcome
             trader_wallet: Trader wallet
         """
-        if observed_price is not None and observed_price > 0:
-            if observed_price < Config.MIN_BUY_PRICE or observed_price > Config.MAX_BUY_PRICE:
-                logger.debug(
-                    f"Skipping copied BUY outside configured range: {market_slug} | {outcome} | "
-                    f"observed=${observed_price:.4f} not in "
-                    f"${Config.MIN_BUY_PRICE:.2f}-${Config.MAX_BUY_PRICE:.2f}"
-                )
-                return
-
         normalized_outcome = await self.api_client.normalize_outcome_to_yes_no(
             market_slug,
             outcome,
@@ -425,6 +604,15 @@ class LiveTradingBot:
         if not normalized_outcome:
             logger.warning(f"Cannot normalize outcome for buy: {market_slug} | {outcome}")
             return
+
+        if observed_price is not None and observed_price > 0:
+            if observed_price < Config.MIN_BUY_PRICE or observed_price > Config.MAX_BUY_PRICE:
+                logger.debug(
+                    f"Skipping copied BUY outside configured range: {market_slug} | {outcome} | "
+                    f"observed=${observed_price:.4f} not in "
+                    f"${Config.MIN_BUY_PRICE:.2f}-${Config.MAX_BUY_PRICE:.2f}"
+                )
+                return
 
         if self._is_us_market_temporarily_untradable(market_slug):
             reasons = self._us_untradable_reasons.get(market_slug) or []
@@ -506,7 +694,7 @@ class LiveTradingBot:
 
         logger.info(
             f"Processing BUY: {market_slug} | {outcome.upper()} | "
-            f"Trader: {trader_wallet[:8]}... | ${effective_observed_price:.4f}"
+            f"Trader: {self._trader_label(trader_wallet)} | ${effective_observed_price:.4f}"
         )
 
         result = await self.trade_executor.execute_buy(
@@ -529,10 +717,22 @@ class LiveTradingBot:
                 )
             return
 
-        if result and result.get("submitted") and result.get("reason") == "BUY_UNFILLED":
-            logger.warning(
-                f"Copied BUY submitted but not filled yet: {market_slug} | {normalized_outcome} | "
-                f"order_id={result.get('order_id')} | state={result.get('state') or 'UNKNOWN'}"
+        if result and result.get("submitted") and result.get("reason") == "BUY_PENDING":
+            pending_order_id = str(result.get("order_id") or "").strip()
+            if pending_order_id:
+                self._track_pending_buy(
+                    pending_order_id,
+                    {
+                        "market_slug": market_slug,
+                        "outcome": normalized_outcome,
+                        "trader_wallet": trader_wallet,
+                        "target_shares": target_shares,
+                        "current_price": to_float(result.get("current_price"), default=current_buy_price),
+                    },
+                )
+            logger.info(
+                f"Copied BUY submitted; awaiting reconciliation: {market_slug} | {normalized_outcome} | "
+                f"order_id={pending_order_id or 'UNKNOWN'} | state={result.get('state') or 'UNKNOWN'}"
             )
             return
         
@@ -555,7 +755,7 @@ class LiveTradingBot:
                 side="BUY",
                 shares=filled_shares,
                 price=filled_price,
-                trader=trader_wallet[:8],
+                trader=self._trader_label(trader_wallet),
                 status="executed",
             )
             if self.google_tracker:
@@ -565,7 +765,7 @@ class LiveTradingBot:
                     side="BUY",
                     shares=filled_shares,
                     price=filled_price,
-                    trader=trader_wallet[:8],
+                    trader=self._trader_label(trader_wallet),
                     status="executed",
                 )
             
@@ -626,68 +826,86 @@ class LiveTradingBot:
             return
 
         if not monitored_trader:
-            logger.info(
-                f"Skipping SELL for unlinked/manual position: {market_slug} | {normalized_outcome} | "
-                f"incoming trader={incoming_trader[:8]}..."
+            recovered_owner = self.position_manager.get_recent_owner_candidate(
+                market_slug,
+                normalized_outcome,
+                Config.POSITION_OWNER_RECOVERY_TTL_SECONDS,
             )
-            return
+            if (
+                Config.SELL_OWNER_CONDITIONAL_ALLOW_ENABLED
+                and recovered_owner
+                and recovered_owner == incoming_trader
+            ):
+                self.position_manager.set_position_monitored_trader(
+                    market_slug,
+                    normalized_outcome,
+                    incoming_trader,
+                )
+                monitored_trader = incoming_trader
+                logger.info(
+                    f"Recovered SELL owner link and allowing copied SELL: {market_slug} | "
+                    f"{normalized_outcome} | trader={self._trader_label(incoming_trader)}"
+                )
+            else:
+                logger.info(
+                    f"Skipping SELL for unlinked/manual position: {market_slug} | {normalized_outcome} | "
+                    f"incoming trader={self._trader_label(incoming_trader)}"
+                )
+                return
 
         if monitored_trader != incoming_trader:
             logger.info(
                 f"Skipping SELL from non-owning trader: {market_slug} | {normalized_outcome} | "
-                f"position owner={monitored_trader[:8]}..., signal trader={incoming_trader[:8]}..."
+                f"position owner={self._trader_label(monitored_trader)}, "
+                f"signal trader={self._trader_label(incoming_trader)}"
             )
             return
 
         shares_to_sell = held_shares
-        if observed_size is not None and observed_size > 0:
-            # IMPORTANT: incoming trade `size` is a trader-size signal (notional-like),
-            # not guaranteed to be literal share quantity on our account.
-            # Mirror BUY sizing behavior for SELLs, then convert notional -> shares.
-            current_sell_price = await self.api_client.get_best_price(market_slug, "sell", normalized_outcome)
-            if current_sell_price and current_sell_price > 0:
-                balance = self.position_manager.balance
-                position_notional = held_shares * current_sell_price
-                sizing_base = balance if (balance is not None and balance > 0) else position_notional
+        copied_sell_shares = max(0.0, to_float(observed_size, default=0.0))
 
-                base_notional = sizing_base * Config.BASE_RISK_PERCENT
-                trade_notional_cap = sizing_base * Config.TAIL_MAX_TRADE_NOTIONAL_PCT
-
-                history = self.trade_monitor.get_size_history(trader_wallet) if trader_wallet else []
-                effective_observed_size = observed_size
-                wallet_median = median(history)
-                percentile = calculate_percentile(history, effective_observed_size) if history else 0.5
-                multiplier = calculate_multiplier(
-                    percentile=percentile,
-                    observed_size=effective_observed_size,
-                    wallet_median_size=wallet_median,
-                    min_multiplier=Config.TAIL_MIN_MULTIPLIER,
-                    max_multiplier=Config.TAIL_MAX_MULTIPLIER,
-                    curve_power=Config.TAIL_MULTIPLIER_CURVE_POWER,
-                    low_size_threshold_ratio=Config.TAIL_LOW_SIZE_THRESHOLD_RATIO,
-                    low_size_haircut_power=Config.TAIL_LOW_SIZE_HAIRCUT_POWER,
-                    low_size_haircut_min_factor=Config.TAIL_LOW_SIZE_HAIRCUT_MIN_FACTOR,
-                )
-
-                normalized_notional = min(base_notional * multiplier, trade_notional_cap)
-
-                # Convert notional budget to shares and cap at live held shares.
-                normalized_shares = normalized_notional / current_sell_price if current_sell_price > 0 else 0.0
-                shares_to_sell = min(held_shares, max(0.0, normalized_shares))
-
-                logger.info(
-                    f"Normalized SELL sizing: {market_slug} | {normalized_outcome} | "
-                    f"observed_size={observed_size:.2f} -> {shares_to_sell:.2f} shares "
-                    f"(held={held_shares:.2f}, px=${current_sell_price:.4f}, mult={multiplier:.3f})"
-                )
-            else:
-                # If we cannot price reliably, avoid using raw observed size as shares.
-                # Fall back to conservative partial liquidation signal handling.
-                shares_to_sell = min(held_shares, held_shares * 0.5)
+        if Config.SELL_PERCENT_SIZING_ENABLED:
+            if copied_sell_shares <= 0:
                 logger.warning(
-                    f"SELL sizing fallback (no current price): {market_slug} | {normalized_outcome} | "
-                    f"selling {shares_to_sell:.2f}/{held_shares:.2f} shares"
+                    f"Skipping SELL: missing copied sell size for percent scaling: {market_slug} | "
+                    f"{normalized_outcome} | trader={self._trader_label(incoming_trader)}"
                 )
+                return
+
+            copied_current_shares = await self._get_copied_position_shares(
+                incoming_trader,
+                market_slug,
+                normalized_outcome,
+            )
+            if copied_current_shares is None:
+                logger.warning(
+                    f"Skipping SELL: copied position denominator unavailable from positions API: "
+                    f"{market_slug} | {normalized_outcome} | trader={self._trader_label(incoming_trader)}"
+                )
+                return
+
+            # Positions snapshot may be post-trade; denominator uses current+sold
+            # to conservatively approximate copied pre-sell position.
+            copied_denominator = copied_current_shares + copied_sell_shares
+            if copied_denominator <= 0:
+                logger.warning(
+                    f"Skipping SELL: invalid copied denominator from positions API: {market_slug} | "
+                    f"{normalized_outcome} | current={copied_current_shares:.4f}, sold={copied_sell_shares:.4f}"
+                )
+                return
+
+            sell_ratio = copied_sell_shares / copied_denominator
+            sizing_reason = "positions_api_denominator"
+
+            sell_ratio = max(0.0, min(1.0, sell_ratio))
+            shares_to_sell = held_shares * sell_ratio
+
+            logger.info(
+                f"SELL percent sizing: {market_slug} | {normalized_outcome} | "
+                f"copied_current={copied_current_shares:.2f}, copied_sell={copied_sell_shares:.2f}, "
+                f"ratio={sell_ratio:.4f}, local_held={held_shares:.2f}, local_sell={shares_to_sell:.2f}, "
+                f"mode={sizing_reason}"
+            )
 
         if shares_to_sell > held_shares:
             logger.info(
@@ -707,7 +925,7 @@ class LiveTradingBot:
         
         logger.info(
             f"Processing SELL: {market_slug} | {outcome.upper()} | "
-            f"Trader: {trader_wallet[:8] if trader_wallet else 'N/A'}... | {shares_to_sell:.2f} shares"
+            f"Trader: {self._trader_label(trader_wallet)} | {shares_to_sell:.2f} shares"
         )
         
         # Execute sell

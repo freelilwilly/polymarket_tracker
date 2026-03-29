@@ -18,12 +18,28 @@ class TradeMonitor:
         """Initialize trade monitor."""
         self.api_client = api_client
         self.slug_converter = slug_converter
+        self.wallet_labels: dict[str, str] = {}
         
         # Track seen trades per wallet to avoid duplicates
         self.seen_trades: dict[str, set[str]] = defaultdict(set)
         
         # Track trade size history per wallet for normalization
         self.size_history: dict[str, list[float]] = defaultdict(list)
+
+    @staticmethod
+    def _short_wallet(wallet: str) -> str:
+        value = str(wallet or "").strip().lower()
+        return f"{value[:8]}..." if value else "UNKNOWN_TRADER"
+
+    def set_wallet_label(self, wallet: str, label: str) -> None:
+        wallet_key = str(wallet or "").strip().lower()
+        display = str(label or "").strip()
+        if wallet_key and display:
+            self.wallet_labels[wallet_key] = display
+
+    def _wallet_label(self, wallet: str) -> str:
+        wallet_key = str(wallet or "").strip().lower()
+        return self.wallet_labels.get(wallet_key) or self._short_wallet(wallet_key)
     
     def initialize_wallet(self, wallet: str, historical_trades: list[dict[str, Any]]) -> None:
         """
@@ -44,7 +60,7 @@ class TradeMonitor:
                 self.size_history[wallet].append(size)
         
         logger.info(
-            f"Initialized {wallet[:8]}: {len(historical_trades)} historical trades, "
+            f"Initialized {self._wallet_label(wallet)}: {len(historical_trades)} historical trades, "
             f"{len(self.size_history[wallet])} sizes tracked"
         )
     
@@ -80,7 +96,7 @@ class TradeMonitor:
             return new_trades
             
         except Exception as e:
-            logger.exception(f"Error collecting trades for {wallet[:8]}: {e}")
+            logger.exception(f"Error collecting trades for {self._wallet_label(wallet)}: {e}")
             return []
 
     def _normalize_trade(self, trade: dict[str, Any]) -> dict[str, Any]:

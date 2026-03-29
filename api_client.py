@@ -13,6 +13,7 @@ import base64
 import json
 import logging
 import time
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
 from typing import Any, Optional
 
@@ -38,12 +39,21 @@ class PolymarketAPIClient:
         "sfo": "sf",
         "tam": "tb",
     }
+
+    STRIPPABLE_SLUG_PREFIXES: set[str] = {
+        "aec",
+        "asc",
+        "asm",
+        "acm",
+        "acx",
+    }
     
     def __init__(self):
         """Initialize API client."""
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_order_error: Optional[dict[str, Any]] = None
         self.slug_converter = SlugConverter()
+        self._market_info_cache: dict[str, dict[str, Any]] = {}
         
         # US Trading Platform endpoints
         self.us_api_base = Config.US_API_BASE_URL
@@ -80,9 +90,16 @@ class PolymarketAPIClient:
     @staticmethod
     def _normalize_slug_value(slug: str) -> str:
         value = str(slug or "").strip().lower()
-        if value.startswith("aec-"):
-            return value[4:]
-        return value
+        if not value:
+            return ""
+
+        parts = [p for p in value.split("-") if p]
+        # Strip known API-side wrappers (for example aec-/asc-) while preserving
+        # canonical market slugs like nba-... or btc-...
+        while len(parts) > 1 and parts[0] in PolymarketAPIClient.STRIPPABLE_SLUG_PREFIXES:
+            parts = parts[1:]
+
+        return "-".join(parts)
 
     @staticmethod
     def _with_aec_prefix(slug: str) -> str:
@@ -288,9 +305,22 @@ class PolymarketAPIClient:
                         continue
                     else:
                         text = await response.text()
-                        logger.warning(
-                            f"Request failed: {method} {url} -> {response.status}: {text}"
-                        )
+                        request_path = urlsplit(url).path
+                        if (
+                            method.upper() == "GET"
+                            and response.status == 404
+                            and "/v1/order/" in request_path
+                            and "order not found" in text.lower()
+                        ):
+                            # Newly-submitted orders can be briefly unavailable on details
+                            # endpoint due to backend visibility lag.
+                            logger.debug(
+                                f"Order details not visible yet: {method} {url} -> {response.status}: {text}"
+                            )
+                        else:
+                            logger.warning(
+                                f"Request failed: {method} {url} -> {response.status}: {text}"
+                            )
                         return None
                         
             except asyncio.TimeoutError:
@@ -453,6 +483,29 @@ class PolymarketAPIClient:
         
         return data if isinstance(data, list) else []
 
+    async def get_user_positions(
+        self,
+        wallet: str,
+        limit: int = 200,
+    ) -> list[dict[str, Any]]:
+        """
+        Get current public positions for a user via Data API.
+
+        Args:
+            wallet: User wallet address
+            limit: Maximum positions to return
+
+        Returns:
+            List of position dicts
+        """
+        url = f"{self.data_api_base}/positions"
+        params = {
+            "user": wallet,
+            "limit": max(1, int(limit)),
+        }
+        data = await self._get_json(url, params=params)
+        return data if isinstance(data, list) else []
+
     async def get_recent_global_trades(self, limit: int = 1000) -> list[dict[str, Any]]:
         """
         Get recent global trades from Data API.
@@ -553,6 +606,16 @@ class PolymarketAPIClient:
         Returns:
             Market info dict or None
         """
+        canonical_slug = self._normalize_slug_value(market_slug)
+        cache_key = canonical_slug or str(market_slug or "").strip().lower()
+
+        now = datetime.now(timezone.utc)
+        cache_entry = self._market_info_cache.get(cache_key)
+        if cache_entry:
+            expires_at = cache_entry.get("expires_at")
+            if isinstance(expires_at, datetime) and now < expires_at:
+                return cache_entry.get("data")
+
         candidate_slugs = self._generate_slug_candidates(market_slug)
         
         data = None
@@ -576,10 +639,36 @@ class PolymarketAPIClient:
                     break
 
         if not data:
-            logger.warning(
-                f"Market not found in Gamma API: original={market_slug}, "
-                f"tried={candidate_slugs}"
-            )
+            previous = cache_entry or {}
+            fail_count = int(previous.get("fail_count") or 0) + 1
+            last_warning_at = previous.get("last_warning_at")
+            warning_cooldown = max(10, int(Config.MARKET_INFO_WARNING_COOLDOWN_SECONDS))
+            warning_threshold = max(1, int(Config.MARKET_INFO_WARNING_THRESHOLD))
+            should_warn = fail_count >= warning_threshold
+            if isinstance(last_warning_at, datetime):
+                since_last = (now - last_warning_at).total_seconds()
+                if since_last < warning_cooldown:
+                    should_warn = False
+
+            if should_warn:
+                logger.warning(
+                    f"Market not found in Gamma API: original={market_slug}, "
+                    f"tried={candidate_slugs}"
+                )
+                last_warning_at = now
+            else:
+                logger.debug(
+                    f"Market lookup unresolved (suppressed): original={market_slug}, "
+                    f"tried={candidate_slugs}, failures={fail_count}"
+                )
+
+            negative_ttl = max(5, int(Config.MARKET_INFO_NEGATIVE_CACHE_SECONDS))
+            self._market_info_cache[cache_key] = {
+                "data": None,
+                "expires_at": now + timedelta(seconds=negative_ttl),
+                "fail_count": fail_count,
+                "last_warning_at": last_warning_at,
+            }
             return None
         
         # Parse outcomes and token IDs from JSON strings to create tokens array
@@ -605,6 +694,14 @@ class PolymarketAPIClient:
             logger.warning(f"Error parsing tokens for {market_slug}: {e}")
             data["tokens"] = []
         
+        positive_ttl = max(5, int(Config.MARKET_INFO_CACHE_SECONDS))
+        self._market_info_cache[cache_key] = {
+            "data": data,
+            "expires_at": now + timedelta(seconds=positive_ttl),
+            "fail_count": 0,
+            "last_warning_at": None,
+        }
+
         return data
     
     async def get_order_book(self, market_slug: str, outcome: str = "yes") -> Optional[dict[str, Any]]:
@@ -626,7 +723,7 @@ class PolymarketAPIClient:
         # Step 1: Get market metadata from GAMMA API
         market_info = await self.get_market_info(market_slug)
         if not market_info:
-            logger.warning(f"Cannot get market info for {market_slug}")
+            logger.debug(f"Cannot get market info for {market_slug}")
             return None
         
         # Step 2: Extract token IDs and outcomes
@@ -672,7 +769,7 @@ class PolymarketAPIClient:
         # get_market_info already handles aec- prefix logic, so just call it directly
         market_info = await self.get_market_info(market_slug)
         if not market_info:
-            logger.warning(f"Cannot get market info for {market_slug}")
+            logger.debug(f"Cannot get market info for {market_slug}")
             return None
         
         tokens = market_info.get("tokens", [])

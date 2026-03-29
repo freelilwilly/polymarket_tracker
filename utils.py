@@ -292,7 +292,7 @@ async def normalize_outcome_to_yes_no(
             logger.info(
                 f"Market metadata unavailable for {slug}. "
                 f"This market may not be indexed in Gamma API yet or may use a different identifier format. "
-                f"Skipping trade."
+                f"Proceeding with caller fallback behavior."
             )
             return None
 

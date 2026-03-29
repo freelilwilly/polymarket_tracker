@@ -36,7 +36,75 @@ class PositionManager:
         self.state_file = "positions_state.json"
         self.balance: Optional[float] = None
         self.buying_power: Optional[float] = None
+        self._recent_owner_cache: dict[str, dict[str, Any]] = {}
         self._load_state()
+
+    def _position_identity(self, market_slug: str, outcome: str) -> str:
+        return self.get_position_key(market_slug, outcome)
+
+    def _canonical_market_slug(self, market_slug: str) -> str:
+        slug = str(market_slug or "").strip().lower()
+        normalizer = getattr(self.api_client, "_normalize_slug_value", None)
+        if callable(normalizer):
+            return str(normalizer(slug) or "").strip().lower()
+        return slug[4:] if slug.startswith("aec-") else slug
+
+    def remember_recent_owner(
+        self,
+        market_slug: str,
+        outcome: str,
+        monitored_trader: Optional[str],
+        shares: float,
+    ) -> None:
+        owner = str(monitored_trader or "").strip().lower()
+        if not owner:
+            return
+        key = self._position_identity(market_slug, outcome)
+        self._recent_owner_cache[key] = {
+            "owner": owner,
+            "shares": max(0.0, to_float(shares, default=0.0)),
+            "removed_at": datetime.now(timezone.utc),
+        }
+
+    def get_recent_owner_candidate(self, market_slug: str, outcome: str, ttl_seconds: int) -> Optional[str]:
+        key = self._position_identity(market_slug, outcome)
+        record = self._recent_owner_cache.get(key)
+        if not record:
+            return None
+
+        removed_at = record.get("removed_at")
+        if not isinstance(removed_at, datetime):
+            self._recent_owner_cache.pop(key, None)
+            return None
+
+        ttl = max(1, int(ttl_seconds))
+        age_seconds = (datetime.now(timezone.utc) - removed_at).total_seconds()
+        if age_seconds > ttl:
+            self._recent_owner_cache.pop(key, None)
+            return None
+
+        owner = str(record.get("owner") or "").strip().lower()
+        return owner or None
+
+    def set_position_monitored_trader(self, market_slug: str, outcome: str, monitored_trader: str) -> bool:
+        key = self.get_position_key(market_slug, outcome)
+        position = self.positions.get(key)
+        owner = str(monitored_trader or "").strip().lower()
+        if not position or not owner:
+            return False
+
+        existing_owner = str(position.get("monitored_trader") or "").strip().lower()
+        if existing_owner == owner:
+            return False
+
+        position["monitored_trader"] = owner
+        self.positions[key] = position
+        self._save_state()
+        logger.info(
+            f"Relinked position owner: {position.get('market_slug')} | {position.get('outcome')} | "
+            "owner relinked"
+        )
+        return True
     
     def _load_state(self):
         """Load positions from state file."""
@@ -44,10 +112,63 @@ class PositionManager:
             try:
                 with open(self.state_file, "r") as f:
                     data = json.load(f)
-                    self.positions = data.get("positions", {})
+                    loaded_positions = data.get("positions", {})
+                    canonical_positions: dict[str, dict[str, Any]] = {}
+                    migrated = 0
+
+                    if isinstance(loaded_positions, dict):
+                        for _, pos in loaded_positions.items():
+                            if not isinstance(pos, dict):
+                                continue
+
+                            raw_slug = str(pos.get("market_slug") or "").strip().lower()
+                            raw_outcome = str(pos.get("outcome") or "").strip().lower()
+                            if not raw_slug or not raw_outcome:
+                                continue
+
+                            canonical_slug = self._canonical_market_slug(raw_slug)
+                            canonical_key = f"{canonical_slug}|{raw_outcome}"
+
+                            normalized_pos = dict(pos)
+                            normalized_pos["market_slug"] = canonical_slug
+                            normalized_pos["outcome"] = raw_outcome
+
+                            if canonical_key in canonical_positions:
+                                # Merge duplicates introduced by canonicalization.
+                                existing = canonical_positions[canonical_key]
+                                existing_shares = to_float(existing.get("shares"), default=0.0)
+                                incoming_shares = to_float(normalized_pos.get("shares"), default=0.0)
+                                existing_invested = to_float(existing.get("invested"), default=0.0)
+                                incoming_invested = to_float(normalized_pos.get("invested"), default=0.0)
+
+                                merged_shares = existing_shares + incoming_shares
+                                merged_invested = existing_invested + incoming_invested
+                                existing["shares"] = merged_shares
+                                existing["invested"] = merged_invested
+                                if merged_shares > 0:
+                                    existing["entry_price"] = merged_invested / merged_shares
+
+                                existing_owner = str(existing.get("monitored_trader") or "").strip()
+                                incoming_owner = str(normalized_pos.get("monitored_trader") or "").strip()
+                                if not existing_owner and incoming_owner:
+                                    existing["monitored_trader"] = incoming_owner
+
+                                canonical_positions[canonical_key] = existing
+                                migrated += 1
+                            else:
+                                canonical_positions[canonical_key] = normalized_pos
+
+                            original_key = str(pos.get("market_slug") or "").strip().lower() + "|" + raw_outcome
+                            if original_key != canonical_key or raw_slug != canonical_slug:
+                                migrated += 1
+
+                    self.positions = canonical_positions
                     self.balance = data.get("balance")
                     self.buying_power = data.get("buying_power")
                     logger.info(f"Loaded {len(self.positions)} positions from state file")
+                    if migrated > 0:
+                        logger.info(f"Migrated {migrated} position entries to canonical slug keys")
+                        self._save_state()
             except Exception as e:
                 logger.exception(f"Error loading positions state: {e}")
                 self.positions = {}
@@ -117,7 +238,7 @@ class PositionManager:
             Position key
         """
         # Normalize slug to canonical form (without aec- prefix)
-        normalized_slug = market_slug[4:] if market_slug.startswith("aec-") else market_slug
+        normalized_slug = self._canonical_market_slug(market_slug)
         return f"{normalized_slug}|{outcome.lower()}"
 
     def reconcile_outcome_alias(
@@ -336,7 +457,7 @@ class PositionManager:
             return
 
         position = {
-            "market_slug": market_slug[4:] if market_slug.startswith("aec-") else market_slug,
+            "market_slug": self._canonical_market_slug(market_slug),
             "outcome": outcome.lower(),
             "shares": shares,
             "entry_price": price,
@@ -500,7 +621,7 @@ class PositionManager:
             primary_outcome = normalized_outcome if normalized_outcome else outcome_lower
             
             # Normalize market slug (remove aec- prefix)
-            normalized_market = market_slug[4:] if market_slug.startswith("aec-") else market_slug
+            normalized_market = self._canonical_market_slug(market_slug)
             
             position_data = {
                 "market_slug": normalized_market,
@@ -577,6 +698,12 @@ class PositionManager:
                     matched_api_positions.add(matched_key)
             
             if not found_in_api:
+                self.remember_recent_owner(
+                    local_market,
+                    local_outcome,
+                    local_pos.get("monitored_trader"),
+                    to_float(local_pos.get("shares"), default=0.0),
+                )
                 logger.warning(
                     f"Position closed externally: {local_market} | {local_outcome} (not found in API)"
                 )
@@ -694,6 +821,12 @@ class PositionManager:
             if invested <= 0:
                 invested = shares * entry_price
 
+            recovered_owner = self.get_recent_owner_candidate(
+                api_pos["market_slug"],
+                api_pos["outcome"],
+                Config.POSITION_OWNER_RECOVERY_TTL_SECONDS,
+            )
+
             self.positions[key] = {
                 "market_slug": api_pos["market_slug"],
                 "outcome": api_pos["outcome"],
@@ -701,10 +834,15 @@ class PositionManager:
                 "entry_price": entry_price,
                 "invested": invested,
                 "opened_at": datetime.now(timezone.utc).isoformat(),
-                "monitored_trader": None,
+                "monitored_trader": recovered_owner,
             }
             imported += 1
             logger.debug(f"Imported new API position: {key}")
+            if recovered_owner:
+                logger.info(
+                    f"Recovered owner for re-imported position: {api_pos['market_slug']} | "
+                    f"{api_pos['outcome']} | owner recovered"
+                )
         
         # Remove any positions with zero shares
         for key in to_remove:
@@ -886,28 +1024,36 @@ class PositionManager:
                     continue
                 
                 # Normalize market slug (remove aec- prefix if present)
-                if isinstance(market_slug, str) and market_slug.startswith("aec-"):
-                    market_slug = market_slug[4:]
+                if isinstance(market_slug, str):
+                    market_slug = self._canonical_market_slug(market_slug)
                 
-                # Get current market price for this position
-                current_price = await self.api_client.get_best_price(market_slug, "sell", outcome)
-                if current_price and current_price > 0:
-                    total_value += shares * current_price
+                raw_data = api_pos.get("raw", {})
+                raw_data = raw_data if isinstance(raw_data, dict) else {}
+
+                # Prefer API-provided mark-like fields to avoid repeated metadata lookups.
+                cur_price = to_float(api_pos.get("curPrice"), default=0.0)
+                if cur_price <= 0:
+                    cur_price = to_float(raw_data.get("curPrice"), default=0.0)
+
+                if cur_price > 0:
+                    total_value += shares * cur_price
+                    continue
+
+                # Fallback to average fill price from API payload.
+                avg_px_data = raw_data.get("avgPx", {})
+                if isinstance(avg_px_data, dict):
+                    avg_px = to_float(avg_px_data.get("value"), default=0.0)
                 else:
-                    # If can't get price, estimate from API-reported average price
-                    raw_data = api_pos.get("raw", {})
-                    if isinstance(raw_data, dict):
-                        avg_px_data = raw_data.get("avgPx", {})
-                        if isinstance(avg_px_data, dict):
-                            avg_px = to_float(avg_px_data.get("value"), default=0.0)
-                        else:
-                            avg_px = to_float(avg_px_data, default=0.0)
-                        
-                        if avg_px > 0:
-                            total_value += shares * avg_px
-                        else:
-                            # Last fallback: assume entry price of 0.50
-                            total_value += shares * 0.50
+                    avg_px = to_float(avg_px_data, default=0.0)
+
+                if avg_px <= 0:
+                    avg_px = to_float(api_pos.get("avgPrice"), default=0.0)
+
+                if avg_px > 0:
+                    total_value += shares * avg_px
+                else:
+                    # Last fallback: neutral midpoint valuation for unresolved marks.
+                    total_value += shares * 0.50
             
             except Exception as e:
                 logger.debug(f"Error calculating value for position: {e}")

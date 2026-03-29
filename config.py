@@ -53,6 +53,20 @@ class Config:
     TRADE_PAGE_SIZE: int = int(os.getenv("TRADE_PAGE_SIZE", "200"))
     TRADE_MAX_PAGES_PER_POLL: int = int(os.getenv("TRADE_MAX_PAGES_PER_POLL", "1"))
     US_UNTRADABLE_CACHE_SECONDS: int = int(os.getenv("US_UNTRADABLE_CACHE_SECONDS", "1800"))
+    MARKET_INFO_CACHE_SECONDS: int = int(os.getenv("MARKET_INFO_CACHE_SECONDS", "300"))
+    MARKET_INFO_NEGATIVE_CACHE_SECONDS: int = int(os.getenv("MARKET_INFO_NEGATIVE_CACHE_SECONDS", "120"))
+    MARKET_INFO_WARNING_COOLDOWN_SECONDS: int = int(os.getenv("MARKET_INFO_WARNING_COOLDOWN_SECONDS", "120"))
+    MARKET_INFO_WARNING_THRESHOLD: int = int(os.getenv("MARKET_INFO_WARNING_THRESHOLD", "3"))
+    BUY_PENDING_RECONCILE_SECONDS: int = int(os.getenv("BUY_PENDING_RECONCILE_SECONDS", "180"))
+    BUY_PENDING_RECHECK_SECONDS: int = int(os.getenv("BUY_PENDING_RECHECK_SECONDS", "20"))
+
+    # Owner-link recovery and copied SELL policy
+    POSITION_OWNER_RECOVERY_TTL_SECONDS: int = int(os.getenv("POSITION_OWNER_RECOVERY_TTL_SECONDS", "600"))
+    SELL_OWNER_CONDITIONAL_ALLOW_ENABLED: bool = os.getenv("SELL_OWNER_CONDITIONAL_ALLOW_ENABLED", "true").lower() in ("true", "1", "yes")
+
+    # Copied SELL sizing behavior
+    SELL_PERCENT_SIZING_ENABLED: bool = os.getenv("SELL_PERCENT_SIZING_ENABLED", "true").lower() in ("true", "1", "yes")
+    SELL_PERCENT_FALLBACK_MAX_RATIO: float = float(os.getenv("SELL_PERCENT_FALLBACK_MAX_RATIO", "0.50"))
     
     # Size Normalization (percentile-based multiplier logic from polymarket_tracker)
     TAIL_MIN_MULTIPLIER: float = float(os.getenv("TAIL_MIN_MULTIPLIER", "0.9"))                         # Min multiplier (small trades)

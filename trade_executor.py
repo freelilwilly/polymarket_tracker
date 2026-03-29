@@ -212,9 +212,10 @@ class TradeExecutor:
             order_id = order_result.get("order_id")
 
             async def _fetch_buy_execution(order_id_value: str) -> dict[str, Any]:
-                """Poll order details briefly and return buy execution summary."""
+                """Poll order details with short backoff and return buy execution summary."""
                 last_details: Optional[dict[str, Any]] = None
-                for _ in range(4):
+                poll_delays = [0.2, 0.25, 0.35, 0.45, 0.6, 0.8, 1.0]
+                for attempt, delay_seconds in enumerate(poll_delays):
                     details = await self.api_client.get_order_details(order_id_value)
                     if isinstance(details, dict):
                         last_details = details
@@ -238,7 +239,8 @@ class TradeExecutor:
                             "REJECTED",
                         }:
                             break
-                    await asyncio.sleep(0.35)
+                    if attempt < len(poll_delays) - 1:
+                        await asyncio.sleep(delay_seconds)
 
                 details = last_details or {}
                 state = str(
@@ -278,13 +280,13 @@ class TradeExecutor:
             order_state = str(execution.get("state") or "")
 
             if filled_qty <= 0:
-                logger.warning(
-                    f"BUY submitted but unfilled so far: {market_slug} | order_id={order_id} | "
+                logger.info(
+                    f"BUY submitted and pending fill visibility: {market_slug} | order_id={order_id} | "
                     f"state={order_state or 'UNKNOWN'}"
                 )
                 return {
                     "submitted": True,
-                    "reason": "BUY_UNFILLED",
+                    "reason": "BUY_PENDING",
                     "order_id": order_id,
                     "state": order_state,
                     "shares": 0.0,

@@ -60,6 +60,21 @@ class TestTradingBot:
         self.running = False
         self.selected_traders: list[dict] = []
         self._last_trader_refresh: datetime | None = None
+        self._trader_display_names: dict[str, str] = {}
+
+    @staticmethod
+    def _short_wallet(wallet: str | None) -> str:
+        value = str(wallet or "").strip().lower()
+        if not value:
+            return "UNKNOWN_TRADER"
+        return f"{value[:8]}..."
+
+    def _trader_label(self, wallet: str | None) -> str:
+        value = str(wallet or "").strip().lower()
+        if not value:
+            return "UNKNOWN_TRADER"
+        label = str(self._trader_display_names.get(value) or "").strip()
+        return label or self._short_wallet(value)
 
     async def _refresh_selected_traders(self):
         """Refresh monitored traders and warm up monitor state."""
@@ -76,6 +91,13 @@ class TestTradingBot:
             wallet = trader.get("wallet")
             if not wallet:
                 continue
+
+            wallet_key = str(wallet).strip().lower()
+            display_name = str(trader.get("display_name") or "").strip()
+            if wallet_key and display_name:
+                self._trader_display_names[wallet_key] = display_name
+                self.trade_monitor.set_wallet_label(wallet_key, display_name)
+
             historical = await self.api_client.get_user_trades(wallet=wallet, limit=Config.TRADE_PAGE_SIZE)
             self.trade_monitor.initialize_wallet(wallet, historical)
     
@@ -148,7 +170,7 @@ class TestTradingBot:
         if not trades:
             return
 
-        logger.info(f"Found {len(trades)} new trade(s) from {wallet[:8]}...")
+        logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)}")
         for trade in trades:
             await self._process_trade(trade, wallet)
 
@@ -246,7 +268,7 @@ class TestTradingBot:
             
             logger.info(
                 f"Processing trade: {market_slug} | {outcome.upper()} | {side.upper()} | "
-                f"Trader: {trader_wallet[:8]}..."
+                f"Trader: {self._trader_label(trader_wallet)}"
             )
             
             # Handle based on side
@@ -378,7 +400,7 @@ class TestTradingBot:
             side="BUY",
             shares=shares,
             price=current_price,
-            trader=trader_wallet[:8],
+            trader=self._trader_label(trader_wallet),
             status="simulated",
         )
         if self.google_tracker:
@@ -388,7 +410,7 @@ class TestTradingBot:
                 side="BUY",
                 shares=shares,
                 price=current_price,
-                trader=trader_wallet[:8],
+                trader=self._trader_label(trader_wallet),
                 status="simulated",
             )
     
