@@ -53,6 +53,13 @@ class LiveTradingBot:
         )
         self.excel_tracker = ExcelTracker(Config.LIVE_EXCEL_WORKBOOK)
         
+        self.google_tracker = None
+        if Config.GOOGLE_SHEETS_ENABLED and Config.GOOGLE_SHEET_ID:
+            from google_sheets_tracker import GoogleSheetsTracker
+            self.google_tracker = GoogleSheetsTracker(
+                Config.GOOGLE_SHEETS_CREDENTIALS, Config.GOOGLE_SHEET_ID
+            )
+        
         self.running = False
         self.selected_traders: list[dict] = []
         self._last_trader_refresh: datetime | None = None
@@ -154,10 +161,18 @@ class LiveTradingBot:
             invested=summary['total_invested'],
             total_positions=summary['total_positions'],
         )
+        if self.google_tracker:
+            self.google_tracker.log_balance(
+                balance=balance,
+                invested=summary['total_invested'],
+                total_positions=summary['total_positions'],
+            )
         
         # Update positions in Excel
         positions = self.position_manager.get_all_positions()
         self.excel_tracker.update_positions(positions)
+        if self.google_tracker:
+            self.google_tracker.update_positions(positions)
         
         # Start loops
         self.running = True
@@ -232,6 +247,12 @@ class LiveTradingBot:
                         invested=summary['total_invested'],
                         total_positions=summary['total_positions'],
                     )
+                    if self.google_tracker:
+                        self.google_tracker.log_balance(
+                            balance=balance,
+                            invested=summary['total_invested'],
+                            total_positions=summary['total_positions'],
+                        )
 
                     positions = self.position_manager.get_all_positions()
                     position_pnl_map = {}
@@ -244,6 +265,8 @@ class LiveTradingBot:
                             position_pnl_map[position_key] = pnl_data
 
                     self.excel_tracker.update_positions(positions, position_pnl_map)
+                    if self.google_tracker:
+                        self.google_tracker.update_positions(positions, position_pnl_map)
 
             except Exception as e:
                 logger.exception(f"Error in maintenance loop: {e}")
@@ -465,6 +488,16 @@ class LiveTradingBot:
                 trader=trader_wallet[:8],
                 status="executed",
             )
+            if self.google_tracker:
+                self.google_tracker.log_trade(
+                    market_slug=market_slug,
+                    outcome=normalized_outcome,
+                    side="BUY",
+                    shares=filled_shares,
+                    price=filled_price,
+                    trader=trader_wallet[:8],
+                    status="executed",
+                )
             
             # If auto-liquidation enabled, order will be created in next cycle
             if Config.ENABLE_AUTO_LIQUIDATION:
@@ -558,6 +591,15 @@ class LiveTradingBot:
                 price=exit_price if exit_price > 0 else 0.0,
                 status="submitted",
             )
+            if self.google_tracker:
+                self.google_tracker.log_trade(
+                    market_slug=market_slug,
+                    outcome=normalized_outcome,
+                    side="SELL",
+                    shares=sold_shares if sold_shares > 0 else shares_to_sell,
+                    price=exit_price if exit_price > 0 else 0.0,
+                    status="submitted",
+                )
 
             await self._cancel_non_liquidation_sell_limits(market_slug, normalized_outcome)
 
@@ -627,6 +669,8 @@ class LiveTradingBot:
         
         # Close Excel tracker
         self.excel_tracker.close()
+        if self.google_tracker:
+            self.google_tracker.close()
         
         # Shutdown API client
         await self.api_client.shutdown()
