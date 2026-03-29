@@ -69,6 +69,11 @@ class Config:
     # Live Mode Configuration
     LIVE_EXCEL_WORKBOOK: str = os.getenv("LIVE_EXCEL_WORKBOOK", "live_performance.xlsx")
     
+    # Google Sheets Configuration
+    GOOGLE_SHEETS_ENABLED: bool = os.getenv("GOOGLE_SHEETS_ENABLED", "false").lower() in ("true", "1", "yes")
+    GOOGLE_SHEETS_CREDENTIALS: str = os.getenv("GOOGLE_SHEETS_CREDENTIALS", "google_credentials.json")
+    GOOGLE_SHEET_ID: str = os.getenv("GOOGLE_SHEET_ID", "")
+
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     LOG_FILE: str = os.getenv("LOG_FILE", "copytrade.log")

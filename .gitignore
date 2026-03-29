@@ -3,6 +3,10 @@
 .env.local
 .env.*.local
 
+# Google credentials
+google_credentials.json
+google_token.pickle
+
 # Python
 __pycache__/
 *.py[cod]
