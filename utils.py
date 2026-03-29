@@ -289,7 +289,11 @@ async def normalize_outcome_to_yes_no(
     try:
         market_info = await api_client.get_market_info(slug)
         if not market_info:
-            logger.warning(f"Cannot get market info for slug: {slug}")
+            logger.info(
+                f"Market metadata unavailable for {slug}. "
+                f"This market may not be indexed in Gamma API yet or may use a different identifier format. "
+                f"Skipping trade."
+            )
             return None
 
         tokens = market_info.get("tokens") or []

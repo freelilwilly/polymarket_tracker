@@ -100,6 +100,11 @@ class TradeMonitor:
             or trade.get("slug")
             or trade.get("eventSlug")
         )
+        
+        # Log full trade object for debugging unknown market slugs
+        if market_slug and not any(x in str(market_slug).lower() for x in ["nba", "nhl", "nfl", "mlb", "ncaab", "ncaaf"]):
+            logger.debug(f"Trade data keys: {list(trade.keys())}")
+            logger.debug(f"Market slug: {market_slug}")
 
         return {
             **trade,

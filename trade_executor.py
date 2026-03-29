@@ -174,20 +174,26 @@ class TradeExecutor:
                 status = order_error.get("status")
                 message = str(order_error.get("message") or "").lower()
 
-                if status in (400, 404) and (
-                    "market not found" in message
-                    or "symbol is required" in message
-                    or "not tradable" in message
-                    or "asset not found" in message
-                ):
+                market_unavailable_reasons = []
+                if "market not found" in message:
+                    market_unavailable_reasons.append("MARKET_NOT_FOUND")
+                if "not tradable" in message:
+                    market_unavailable_reasons.append("NOT_TRADABLE")
+                if "asset not found" in message:
+                    market_unavailable_reasons.append("ASSET_NOT_FOUND")
+
+                # "symbol is required" has proven to be noisy/ambiguous in the US API;
+                # do not treat it as definitive market-unavailable signal.
+                if status in (400, 404) and market_unavailable_reasons:
                     logger.info(
                         f"US market unavailable for trading, skipping: {market_slug} | "
-                        f"status={status}"
+                        f"status={status} | reasons={','.join(market_unavailable_reasons)}"
                     )
                     return {
                         "skipped": True,
                         "reason": "US_MARKET_UNAVAILABLE",
                         "status": status,
+                        "market_unavailable_reasons": market_unavailable_reasons,
                     }
 
                 logger.warning(f"Order placement failed for {market_slug}")

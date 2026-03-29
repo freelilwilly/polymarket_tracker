@@ -84,6 +84,11 @@ class LiveTradingBot:
             f"(until {expires_at.isoformat()})"
         )
 
+    def _clear_us_market_untradable(self, market_slug: str):
+        if market_slug in self._us_untradable_until:
+            self._us_untradable_until.pop(market_slug, None)
+            logger.info(f"Removed US-untradable cache for market: {market_slug}")
+
     async def _refresh_selected_traders(self):
         """Refresh monitored traders and warm up monitor state."""
         logger.info("Refreshing selected traders...")
@@ -280,15 +285,25 @@ class LiveTradingBot:
             try:
                 balance = self.position_manager.balance
                 if balance is not None:
+                    # CRITICAL: Sync with API first to ensure accurate position count
+                    # This prevents showing stale cached position data in account status
+                    await self.position_manager.sync_positions_with_api()
+                    
                     summary = self.position_manager.get_summary()
                     cash = summary.get("buying_power")
                     if cash is None:
                         cash = max(0.0, balance - summary["total_invested"])
-                    positions_value = max(0.0, balance - cash)
+                    
+                    # Calculate actual position value from current market prices (already uses fresh API data)
+                    positions_value = await self.position_manager.get_total_positions_value()
+                    
+                    # Total equity should be cash + positions
+                    total_equity = cash + positions_value
+                    
                     logger.info(
                         f"Account: cash=${cash:.2f} | "
                         f"positions=${positions_value:.2f} | "
-                        f"equity=${balance:.2f} | "
+                        f"equity=${total_equity:.2f} | "
                         f"{summary['total_positions']} open"
                     )
             except Exception as e:
@@ -325,11 +340,6 @@ class LiveTradingBot:
             if not is_sports_market(market_slug):
                 logger.debug(f"Skipping non-sports market: {market_slug}")
                 return
-            
-            logger.info(
-                f"Processing trade: {market_slug} | {outcome.upper()} | {side.upper()} | "
-                f"Trader: {trader_wallet[:8]}..."
-            )
             
             # Handle based on side
             if side_upper == "BUY":
@@ -374,18 +384,12 @@ class LiveTradingBot:
         """
         if observed_price is not None and observed_price > 0:
             if observed_price < Config.MIN_BUY_PRICE or observed_price > Config.MAX_BUY_PRICE:
-                logger.info(
+                logger.debug(
                     f"Skipping copied BUY outside configured range: {market_slug} | {outcome} | "
                     f"observed=${observed_price:.4f} not in "
                     f"${Config.MIN_BUY_PRICE:.2f}-${Config.MAX_BUY_PRICE:.2f}"
                 )
                 return
-
-        if self._is_us_market_temporarily_untradable(market_slug):
-            logger.info(
-                f"Skipping BUY for temporarily cached US-untradable market: {market_slug}"
-            )
-            return
 
         normalized_outcome = await self.api_client.normalize_outcome_to_yes_no(
             market_slug,
@@ -396,6 +400,21 @@ class LiveTradingBot:
         if not normalized_outcome:
             logger.warning(f"Cannot normalize outcome for buy: {market_slug} | {outcome}")
             return
+
+        if self._is_us_market_temporarily_untradable(market_slug):
+            # Revalidate cached-untradable markets to recover quickly from false negatives.
+            probe_price = await self.api_client.get_best_price(market_slug, "buy", normalized_outcome)
+            if probe_price and probe_price > 0:
+                self._clear_us_market_untradable(market_slug)
+                logger.info(
+                    f"US market cache revalidated as tradable: {market_slug} | {normalized_outcome} | "
+                    f"price=${probe_price:.4f}"
+                )
+            else:
+                logger.info(
+                    f"Skipping BUY for temporarily cached US-untradable market: {market_slug}"
+                )
+                return
 
         self.position_manager.reconcile_outcome_alias(
             market_slug=market_slug,
@@ -414,7 +433,7 @@ class LiveTradingBot:
             return
 
         if current_buy_price < Config.MIN_BUY_PRICE or current_buy_price > Config.MAX_BUY_PRICE:
-            logger.info(
+            logger.debug(
                 f"Price ${current_buy_price:.4f} out of range "
                 f"(${Config.MIN_BUY_PRICE:.2f}-${Config.MAX_BUY_PRICE:.2f}), skipping"
             )
@@ -455,6 +474,11 @@ class LiveTradingBot:
         target_shares = investment_amount / current_buy_price
         effective_observed_price = observed_price if (observed_price and observed_price > 0) else current_buy_price
 
+        logger.info(
+            f"Processing BUY: {market_slug} | {outcome.upper()} | "
+            f"Trader: {trader_wallet[:8]}... | ${effective_observed_price:.4f}"
+        )
+
         result = await self.trade_executor.execute_buy(
             market_slug=market_slug,
             observed_price=effective_observed_price,
@@ -463,7 +487,16 @@ class LiveTradingBot:
         )
 
         if result and result.get("skipped") and result.get("reason") == "US_MARKET_UNAVAILABLE":
-            self._mark_us_market_untradable(market_slug)
+            # Only cache for definitive unavailable reasons.
+            reasons = result.get("market_unavailable_reasons") or []
+            definitive_reasons = {"MARKET_NOT_FOUND", "NOT_TRADABLE", "ASSET_NOT_FOUND"}
+            if any(r in definitive_reasons for r in reasons):
+                self._mark_us_market_untradable(market_slug)
+            else:
+                logger.info(
+                    f"US market unavailable was non-definitive; not caching: {market_slug} | "
+                    f"reasons={reasons}"
+                )
             return
         
         if result and result.get("success"):
@@ -545,29 +578,85 @@ class LiveTradingBot:
 
         shares_to_sell = held_shares
         if observed_size is not None and observed_size > 0:
-            shares_to_sell = observed_size
+            # IMPORTANT: incoming trade `size` is a trader-size signal (notional-like),
+            # not guaranteed to be literal share quantity on our account.
+            # Mirror BUY sizing behavior for SELLs, then convert notional -> shares.
+            current_sell_price = await self.api_client.get_best_price(market_slug, "sell", normalized_outcome)
+            if current_sell_price and current_sell_price > 0:
+                balance = self.position_manager.balance
+                position_notional = held_shares * current_sell_price
+                sizing_base = balance if (balance is not None and balance > 0) else position_notional
+
+                base_notional = sizing_base * Config.BASE_RISK_PERCENT
+                trade_notional_cap = sizing_base * Config.TAIL_MAX_TRADE_NOTIONAL_PCT
+
+                history = self.trade_monitor.get_size_history(trader_wallet) if trader_wallet else []
+                effective_observed_size = observed_size
+                wallet_median = median(history)
+                percentile = calculate_percentile(history, effective_observed_size) if history else 0.5
+                multiplier = calculate_multiplier(
+                    percentile=percentile,
+                    observed_size=effective_observed_size,
+                    wallet_median_size=wallet_median,
+                    min_multiplier=Config.TAIL_MIN_MULTIPLIER,
+                    max_multiplier=Config.TAIL_MAX_MULTIPLIER,
+                    curve_power=Config.TAIL_MULTIPLIER_CURVE_POWER,
+                    low_size_threshold_ratio=Config.TAIL_LOW_SIZE_THRESHOLD_RATIO,
+                    low_size_haircut_power=Config.TAIL_LOW_SIZE_HAIRCUT_POWER,
+                    low_size_haircut_min_factor=Config.TAIL_LOW_SIZE_HAIRCUT_MIN_FACTOR,
+                )
+
+                normalized_notional = min(base_notional * multiplier, trade_notional_cap)
+
+                # Convert notional budget to shares and cap at live held shares.
+                normalized_shares = normalized_notional / current_sell_price if current_sell_price > 0 else 0.0
+                shares_to_sell = min(held_shares, max(0.0, normalized_shares))
+
+                logger.info(
+                    f"Normalized SELL sizing: {market_slug} | {normalized_outcome} | "
+                    f"observed_size={observed_size:.2f} -> {shares_to_sell:.2f} shares "
+                    f"(held={held_shares:.2f}, px=${current_sell_price:.4f}, mult={multiplier:.3f})"
+                )
+            else:
+                # If we cannot price reliably, avoid using raw observed size as shares.
+                # Fall back to conservative partial liquidation signal handling.
+                shares_to_sell = min(held_shares, held_shares * 0.5)
+                logger.warning(
+                    f"SELL sizing fallback (no current price): {market_slug} | {normalized_outcome} | "
+                    f"selling {shares_to_sell:.2f}/{held_shares:.2f} shares"
+                )
 
         monitored_trader = str(position.get("monitored_trader") or "").strip().lower()
         incoming_trader = str(trader_wallet or "").strip().lower()
         same_trader = bool(monitored_trader and incoming_trader and monitored_trader == incoming_trader)
 
-        if shares_to_sell > held_shares and same_trader:
+        if shares_to_sell > held_shares:
             logger.info(
-                f"Oversell signal from owning trader; liquidating full held size: "
-                f"requested={shares_to_sell:.2f}, held={held_shares:.2f}"
+                f"Oversell signal capped to held size: requested={shares_to_sell:.2f}, held={held_shares:.2f}"
             )
             shares_to_sell = held_shares
+
+        if shares_to_sell <= 0:
+            logger.warning(
+                f"Computed non-positive SELL size for {market_slug} | {normalized_outcome}; skipping"
+            )
+            return
 
         # Cancel liquidation order if exists
         if Config.ENABLE_AUTO_LIQUIDATION:
             await self.liquidation_manager.cancel_liquidation_order(market_slug, normalized_outcome)
+        
+        logger.info(
+            f"Processing SELL: {market_slug} | {outcome.upper()} | "
+            f"Trader: {trader_wallet[:8] if trader_wallet else 'N/A'}... | {shares_to_sell:.2f} shares"
+        )
         
         # Execute sell
         result = await self.trade_executor.execute_sell(
             market_slug=market_slug,
             shares=shares_to_sell,
             outcome=normalized_outcome,
-            allow_full_liquidation_on_oversell=same_trader,
+            allow_full_liquidation_on_oversell=True,
             treat_as_market=True,
         )
         
