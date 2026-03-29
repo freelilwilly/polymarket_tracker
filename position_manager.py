@@ -37,6 +37,7 @@ class PositionManager:
         self.balance: Optional[float] = None
         self.buying_power: Optional[float] = None
         self._recent_owner_cache: dict[str, dict[str, Any]] = {}
+        self._sync_missing_counts: dict[str, int] = {}
         self._load_state()
 
     def _position_identity(self, market_slug: str, outcome: str) -> str:
@@ -105,6 +106,59 @@ class PositionManager:
             "owner relinked"
         )
         return True
+
+    @staticmethod
+    def _deserialize_timestamp(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if not value:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            return None
+
+    def _serialize_recent_owner_cache(self) -> dict[str, dict[str, Any]]:
+        serialized: dict[str, dict[str, Any]] = {}
+        for key, record in self._recent_owner_cache.items():
+            if not isinstance(record, dict):
+                continue
+            owner = str(record.get("owner") or "").strip().lower()
+            if not owner:
+                continue
+            removed_at = self._deserialize_timestamp(record.get("removed_at"))
+            if removed_at is None:
+                removed_at = datetime.now(timezone.utc)
+            serialized[key] = {
+                "owner": owner,
+                "shares": max(0.0, to_float(record.get("shares"), default=0.0)),
+                "removed_at": removed_at.isoformat(),
+            }
+        return serialized
+
+    def _load_recent_owner_cache(self, raw_cache: Any) -> None:
+        self._recent_owner_cache = {}
+        if not isinstance(raw_cache, dict):
+            return
+
+        for key, record in raw_cache.items():
+            if not isinstance(record, dict):
+                continue
+            owner = str(record.get("owner") or "").strip().lower()
+            removed_at = self._deserialize_timestamp(record.get("removed_at"))
+            if not owner or removed_at is None:
+                continue
+            self._recent_owner_cache[str(key)] = {
+                "owner": owner,
+                "shares": max(0.0, to_float(record.get("shares"), default=0.0)),
+                "removed_at": removed_at,
+            }
     
     def _load_state(self):
         """Load positions from state file."""
@@ -163,8 +217,24 @@ class PositionManager:
                                 migrated += 1
 
                     self.positions = canonical_positions
+                    for pos in self.positions.values():
+                        if not isinstance(pos, dict):
+                            continue
+                        owner = str(pos.get("monitored_trader") or "").strip().lower()
+                        pos["monitored_trader"] = owner or None
+
                     self.balance = data.get("balance")
                     self.buying_power = data.get("buying_power")
+                    self._load_recent_owner_cache(data.get("recent_owner_cache", {}))
+
+                    raw_sync_missing_counts = data.get("sync_missing_counts", {})
+                    self._sync_missing_counts = {}
+                    if isinstance(raw_sync_missing_counts, dict):
+                        for key, value in raw_sync_missing_counts.items():
+                            misses = int(to_float(value, default=0.0))
+                            if misses > 0:
+                                self._sync_missing_counts[str(key)] = misses
+
                     logger.info(f"Loaded {len(self.positions)} positions from state file")
                     if migrated > 0:
                         logger.info(f"Migrated {migrated} position entries to canonical slug keys")
@@ -180,6 +250,8 @@ class PositionManager:
                 "positions": self.positions,
                 "balance": self.balance,
                 "buying_power": self.buying_power,
+                "recent_owner_cache": self._serialize_recent_owner_cache(),
+                "sync_missing_counts": self._sync_missing_counts,
                 "last_updated": datetime.now(timezone.utc).isoformat(),
             }
             
@@ -424,6 +496,7 @@ class PositionManager:
             monitored_trader: Trader wallet we copied (optional)
         """
         key = self.get_position_key(market_slug, outcome)
+        owner = str(monitored_trader or "").strip().lower()
 
         # Calculate invested amount for this fill (shares * price)
         new_invested = shares * price
@@ -443,8 +516,8 @@ class PositionManager:
             existing["outcome"] = outcome.lower()
 
             # Keep first opened timestamp; refresh copied-trader source if provided.
-            if monitored_trader:
-                existing["monitored_trader"] = monitored_trader
+            if owner:
+                existing["monitored_trader"] = owner
 
             self.positions[key] = existing
             self._save_state()
@@ -463,7 +536,7 @@ class PositionManager:
             "entry_price": price,
             "invested": new_invested,
             "opened_at": datetime.now(timezone.utc).isoformat(),
-            "monitored_trader": monitored_trader,
+            "monitored_trader": owner or None,
         }
 
         self.positions[key] = position
@@ -657,6 +730,7 @@ class PositionManager:
         for key, local_pos in self.positions.items():
             local_market = local_pos['market_slug']
             local_outcome = local_pos['outcome']
+            miss_identity = self._position_identity(local_market, local_outcome)
             
             # Try various matching strategies
             found_in_api = False
@@ -698,6 +772,15 @@ class PositionManager:
                     matched_api_positions.add(matched_key)
             
             if not found_in_api:
+                misses = int(self._sync_missing_counts.get(miss_identity, 0)) + 1
+                self._sync_missing_counts[miss_identity] = misses
+                if misses < max(1, Config.POSITION_SYNC_MISS_THRESHOLD):
+                    logger.warning(
+                        f"Deferring external close until miss threshold: {local_market} | {local_outcome} | "
+                        f"misses={misses}/{max(1, Config.POSITION_SYNC_MISS_THRESHOLD)}"
+                    )
+                    continue
+
                 self.remember_recent_owner(
                     local_market,
                     local_outcome,
@@ -705,9 +788,12 @@ class PositionManager:
                     to_float(local_pos.get("shares"), default=0.0),
                 )
                 logger.warning(
-                    f"Position closed externally: {local_market} | {local_outcome} (not found in API)"
+                    f"Position closed externally after miss threshold: {local_market} | {local_outcome} | "
+                    f"misses={misses}"
                 )
                 to_remove.append(key)
+            else:
+                self._sync_missing_counts.pop(miss_identity, None)
         
         # Remove closed positions
         for key in to_remove:
@@ -755,6 +841,7 @@ class PositionManager:
                     matched_api_positions.add(matched_api_key)
             
             if api_data:
+                self._sync_missing_counts.pop(self._position_identity(local_market, local_outcome), None)
                 api_shares = api_data["shares"]
                 local_shares = local_pos["shares"]
                 
@@ -843,10 +930,19 @@ class PositionManager:
                     f"Recovered owner for re-imported position: {api_pos['market_slug']} | "
                     f"{api_pos['outcome']} | owner recovered"
                 )
+            else:
+                logger.warning(
+                    f"Imported API position without owner link: {api_pos['market_slug']} | {api_pos['outcome']}"
+                )
         
         # Remove any positions with zero shares
         for key in to_remove:
-            self.positions.pop(key, None)
+            pos = self.positions.pop(key, None)
+            if isinstance(pos, dict):
+                self._sync_missing_counts.pop(
+                    self._position_identity(pos.get("market_slug"), pos.get("outcome")),
+                    None,
+                )
         
         # FINAL DEDUPLICATION: Remove any duplicate positions (same market+outcome, different keys)
         # This can happen if there were legacy positions that weren't caught by migration
@@ -873,7 +969,12 @@ class PositionManager:
                 seen_positions[pos_id] = key
         
         for key in duplicates_to_remove:
-            self.positions.pop(key, None)
+            pos = self.positions.pop(key, None)
+            if isinstance(pos, dict):
+                self._sync_missing_counts.pop(
+                    self._position_identity(pos.get("market_slug"), pos.get("outcome")),
+                    None,
+                )
         
         if to_remove or imported or migrated or duplicates_to_remove:
             self._save_state()
@@ -913,8 +1014,8 @@ class PositionManager:
             
             if unique_over_cap:
                 for pos_info in unique_over_cap:
-                    logger.warning(
-                        f"Position exceeds market cap: {pos_info['market_slug']} | "
+                    logger.debug(
+                        f"Position exceeds market cap (post-sync state): {pos_info['market_slug']} | "
                         f"Exposure=${pos_info['exposure']:.2f} | Cap=${pos_info['cap']:.2f} | "
                         f"Over by ${pos_info['excess']:.2f} ({pos_info['excess']/pos_info['cap']*100:.1f}%)"
                     )

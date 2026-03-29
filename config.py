@@ -52,6 +52,12 @@ class Config:
     TRADE_POLL_CONCURRENCY: int = int(os.getenv("TRADE_POLL_CONCURRENCY", "10"))
     TRADE_PAGE_SIZE: int = int(os.getenv("TRADE_PAGE_SIZE", "200"))
     TRADE_MAX_PAGES_PER_POLL: int = int(os.getenv("TRADE_MAX_PAGES_PER_POLL", "1"))
+    TRADE_MAX_PAGES_PER_POLL_BURST: int = int(os.getenv("TRADE_MAX_PAGES_PER_POLL_BURST", "3"))
+    TRADE_DUPLICATE_ANOMALY_RATIO: float = float(os.getenv("TRADE_DUPLICATE_ANOMALY_RATIO", "0.60"))
+    TRADE_ADAPTIVE_FETCH_ENABLED: bool = os.getenv("TRADE_ADAPTIVE_FETCH_ENABLED", "false").lower() in ("true", "1", "yes")
+    POTENTIAL_DUPLICATE_ALERT_THRESHOLD: int = int(os.getenv("POTENTIAL_DUPLICATE_ALERT_THRESHOLD", "5"))
+    COPY_LARGEST_BUY_PER_CYCLE_ENABLED: bool = os.getenv("COPY_LARGEST_BUY_PER_CYCLE_ENABLED", "true").lower() in ("true", "1", "yes")
+    NON_SPORTS_SKIP_CACHE_SECONDS: int = int(os.getenv("NON_SPORTS_SKIP_CACHE_SECONDS", "1800"))
     US_UNTRADABLE_CACHE_SECONDS: int = int(os.getenv("US_UNTRADABLE_CACHE_SECONDS", "1800"))
     MARKET_INFO_CACHE_SECONDS: int = int(os.getenv("MARKET_INFO_CACHE_SECONDS", "300"))
     MARKET_INFO_NEGATIVE_CACHE_SECONDS: int = int(os.getenv("MARKET_INFO_NEGATIVE_CACHE_SECONDS", "120"))
@@ -62,6 +68,7 @@ class Config:
 
     # Owner-link recovery and copied SELL policy
     POSITION_OWNER_RECOVERY_TTL_SECONDS: int = int(os.getenv("POSITION_OWNER_RECOVERY_TTL_SECONDS", "600"))
+    POSITION_SYNC_MISS_THRESHOLD: int = int(os.getenv("POSITION_SYNC_MISS_THRESHOLD", "3"))
     SELL_OWNER_CONDITIONAL_ALLOW_ENABLED: bool = os.getenv("SELL_OWNER_CONDITIONAL_ALLOW_ENABLED", "true").lower() in ("true", "1", "yes")
 
     # Copied SELL sizing behavior

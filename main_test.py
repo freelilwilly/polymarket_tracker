@@ -67,9 +67,13 @@ class TestTradingBot:
         self.running = False
         self.selected_traders: list[dict] = []
         self._last_trader_refresh: datetime | None = None
+        self._non_sports_untradable_until: dict[str, datetime] = {}
         self._us_untradable_until: dict[str, datetime] = {}
         self._us_untradable_reasons: dict[str, list[str]] = {}
+        self._pending_buy_orders: dict[str, dict[str, Any]] = {}
         self._trader_display_names: dict[str, str] = {}
+        self._startup_bootstrap_pending_wallets: set[str] = set()
+        self._selected_at_by_wallet_epoch: dict[str, float] = {}
 
     def _is_us_market_temporarily_untradable(self, market_slug: str) -> bool:
         expires_at = self._us_untradable_until.get(market_slug)
@@ -81,7 +85,12 @@ class TestTradingBot:
             return False
         return True
 
-    def _mark_us_market_untradable(self, market_slug: str, reasons: list[str] | None = None):
+    def _mark_us_market_untradable(
+        self,
+        market_slug: str,
+        reasons: list[str] | None = None,
+        unavailable_markets_logged: set[str] | None = None,
+    ):
         base_ttl = max(1, int(Config.US_UNTRADABLE_CACHE_SECONDS))
         reason_set = {str(r or "").strip().upper() for r in (reasons or []) if str(r or "").strip()}
 
@@ -94,10 +103,28 @@ class TestTradingBot:
         expires_at = expires_at + timedelta(seconds=ttl_seconds)
         self._us_untradable_until[market_slug] = expires_at
         self._us_untradable_reasons[market_slug] = sorted(reason_set)
-        logger.info(
-            f"Caching US-untradable market for {ttl_seconds}s: {market_slug} "
-            f"(until {expires_at.isoformat()}) | reasons={sorted(reason_set)}"
+        self._log_unavailable_market_once(
+            market_slug,
+            "unavailable_us",
+            unavailable_markets_logged,
         )
+
+    def _log_unavailable_market_once(
+        self,
+        market_slug: str,
+        marker: str,
+        unavailable_markets_logged: set[str] | None = None,
+    ) -> None:
+        if unavailable_markets_logged is None:
+            logger.info(f"market: {market_slug} | {marker}")
+            return
+
+        normalized_slug = self._normalize_market_slug(market_slug)
+        if normalized_slug in unavailable_markets_logged:
+            return
+
+        unavailable_markets_logged.add(normalized_slug)
+        logger.info(f"market: {market_slug} | {marker}")
 
     @staticmethod
     def _normalize_market_slug(slug: str) -> str:
@@ -105,6 +132,247 @@ class TestTradingBot:
         if value.startswith("aec-"):
             return value[4:]
         return value
+
+    def _is_non_sports_market_cached(self, market_slug: str) -> bool:
+        normalized_slug = self._normalize_market_slug(market_slug)
+        expires_at = self._non_sports_untradable_until.get(normalized_slug)
+        if not expires_at:
+            return False
+        if datetime.now(timezone.utc) >= expires_at:
+            self._non_sports_untradable_until.pop(normalized_slug, None)
+            return False
+        return True
+
+    def _cache_non_sports_market(self, market_slug: str) -> None:
+        normalized_slug = self._normalize_market_slug(market_slug)
+        ttl_seconds = max(1, int(Config.NON_SPORTS_SKIP_CACHE_SECONDS))
+        expires_at = datetime.now(timezone.utc).replace(microsecond=0)
+        expires_at = expires_at + timedelta(seconds=ttl_seconds)
+        self._non_sports_untradable_until[normalized_slug] = expires_at
+        logger.info(f"Caching non-sports skip: {market_slug} | ttl={ttl_seconds}s")
+
+    @staticmethod
+    def _trade_timestamp_epoch(trade: dict[str, Any]) -> float:
+        for field in ("timestamp", "createdAt", "created_at", "time"):
+            raw = trade.get(field)
+            if raw is None:
+                continue
+
+            if isinstance(raw, (int, float)):
+                value = float(raw)
+                if value <= 0:
+                    continue
+                if value > 1e12:
+                    value = value / 1000.0
+                return value
+
+            if isinstance(raw, str):
+                text = raw.strip()
+                if not text:
+                    continue
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                try:
+                    parsed = datetime.fromisoformat(text)
+                    if parsed.tzinfo is None:
+                        parsed = parsed.replace(tzinfo=timezone.utc)
+                    else:
+                        parsed = parsed.astimezone(timezone.utc)
+                    return parsed.timestamp()
+                except ValueError:
+                    continue
+
+        return 0.0
+
+    def _filter_largest_buy_per_cycle(self, trades: list[dict[str, Any]], wallet: str) -> list[dict[str, Any]]:
+        if not trades or not Config.COPY_LARGEST_BUY_PER_CYCLE_ENABLED:
+            return trades
+
+        indexed_trades = list(enumerate(trades))
+        grouped_buys: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
+        kept_indices: set[int] = set()
+
+        for idx, trade in indexed_trades:
+            side = str(trade.get("side") or "").strip().upper()
+            if side != "BUY":
+                kept_indices.add(idx)
+                continue
+
+            market_slug = str(trade.get("market_slug") or "").strip()
+            outcome = str(trade.get("outcome") or "").strip()
+            if not market_slug or not outcome:
+                kept_indices.add(idx)
+                continue
+
+            key = (market_slug.lower(), outcome.lower())
+            grouped_buys.setdefault(key, []).append((idx, trade))
+
+        filtered_groups = 0
+        for (market_slug, outcome), entries in grouped_buys.items():
+            if len(entries) == 1:
+                kept_indices.add(entries[0][0])
+                continue
+
+            winner_idx = entries[0][0]
+            winner_trade = entries[0][1]
+            winner_size = max(0.0, to_float(winner_trade.get("size"), default=0.0))
+            winner_ts = self._trade_timestamp_epoch(winner_trade)
+
+            for idx, trade in entries[1:]:
+                size = max(0.0, to_float(trade.get("size"), default=0.0))
+                ts = self._trade_timestamp_epoch(trade)
+                if size > winner_size or (size == winner_size and ts > winner_ts):
+                    winner_idx = idx
+                    winner_trade = trade
+                    winner_size = size
+                    winner_ts = ts
+
+            kept_indices.add(winner_idx)
+            filtered_groups += len(entries) - 1
+            winner_trade["_largest_buy_filter_meta"] = {
+                "market_slug": market_slug,
+                "outcome": outcome,
+                "kept_size": winner_size,
+                "filtered_count": len(entries) - 1,
+                "trader_label": self._trader_label(wallet),
+            }
+
+        if filtered_groups <= 0:
+            return trades
+
+        return [trade for idx, trade in indexed_trades if idx in kept_indices]
+
+    def _filter_startup_history_trades(
+        self,
+        trades: list[dict[str, Any]],
+        wallet_key: str,
+    ) -> list[dict[str, Any]]:
+        if wallet_key not in self._startup_bootstrap_pending_wallets:
+            return trades
+
+        selected_at_epoch = self._selected_at_by_wallet_epoch.get(wallet_key)
+        if not selected_at_epoch:
+            self._startup_bootstrap_pending_wallets.discard(wallet_key)
+            self.trade_monitor.set_bootstrap_mode(wallet_key, False)
+            return trades
+
+        incoming: list[dict[str, Any]] = []
+        for trade in trades:
+            trade_epoch = self._trade_timestamp_epoch(trade)
+            if trade_epoch > selected_at_epoch:
+                incoming.append(trade)
+
+        if incoming:
+            self._startup_bootstrap_pending_wallets.discard(wallet_key)
+            self.trade_monitor.set_bootstrap_mode(wallet_key, False)
+
+        return incoming
+
+    @staticmethod
+    def _parse_order_execution(details: dict[str, Any] | None) -> tuple[str, float, float]:
+        payload = details if isinstance(details, dict) else {}
+        state = str(
+            payload.get("state") or payload.get("status") or payload.get("orderState") or ""
+        ).upper()
+
+        cum_data = (
+            payload.get("cumQuantity")
+            or payload.get("cumQty")
+            or payload.get("filledQuantity")
+            or payload.get("executedQuantity")
+            or 0
+        )
+        if isinstance(cum_data, dict):
+            cum_qty = to_float(cum_data.get("value"), default=0.0)
+        else:
+            cum_qty = to_float(cum_data, default=0.0)
+
+        avg_data = payload.get("avgPx") or payload.get("avgPrice") or payload.get("averagePrice") or 0
+        if isinstance(avg_data, dict):
+            avg_px = to_float(avg_data.get("value"), default=0.0)
+        else:
+            avg_px = to_float(avg_data, default=0.0)
+
+        return state, max(0.0, cum_qty), max(0.0, avg_px)
+
+    def _track_pending_buy(self, order_id: str, record: dict[str, Any]):
+        self._pending_buy_orders[str(order_id)] = {
+            **record,
+            "created_at": datetime.now(timezone.utc),
+            "next_check_at": datetime.now(timezone.utc),
+            "checks": 0,
+        }
+
+    async def _reconcile_pending_buys(self):
+        if not self._pending_buy_orders:
+            return
+
+        now = datetime.now(timezone.utc)
+        terminal_states = {
+            "ORDER_STATE_CANCELLED",
+            "CANCELLED",
+            "CANCELED",
+            "ORDER_STATE_EXPIRED",
+            "EXPIRED",
+            "ORDER_STATE_REJECTED",
+            "REJECTED",
+        }
+
+        for order_id, record in list(self._pending_buy_orders.items()):
+            next_check_at = record.get("next_check_at")
+            if isinstance(next_check_at, datetime) and now < next_check_at:
+                continue
+
+            created_at = record.get("created_at") if isinstance(record.get("created_at"), datetime) else now
+            age_seconds = (now - created_at).total_seconds()
+            if age_seconds > max(30, Config.BUY_PENDING_RECONCILE_SECONDS):
+                logger.warning(
+                    f"Pending BUY reconciliation timeout: {record.get('market_slug')} | {record.get('outcome')} | "
+                    f"order_id={order_id}"
+                )
+                self._pending_buy_orders.pop(order_id, None)
+                continue
+
+            details = await self.api_client.get_order_details(order_id)
+            state, cum_qty, avg_px = self._parse_order_execution(details)
+
+            market_slug = str(record.get("market_slug") or "")
+            outcome = str(record.get("outcome") or "")
+            trader_wallet = str(record.get("trader_wallet") or "")
+
+            if cum_qty > 0:
+                position = self.position_manager.get_position(market_slug, outcome)
+                if position:
+                    if trader_wallet:
+                        self.position_manager.set_position_monitored_trader(market_slug, outcome, trader_wallet)
+                else:
+                    fill_price = avg_px if avg_px > 0 else to_float(record.get("current_price"), default=0.0)
+                    self.position_manager.open_position(
+                        market_slug=market_slug,
+                        outcome=outcome,
+                        shares=cum_qty,
+                        price=fill_price if fill_price > 0 else max(0.01, to_float(record.get("current_price"), default=0.5)),
+                        monitored_trader=trader_wallet or None,
+                    )
+
+                logger.info(
+                    f"Reconciled pending BUY as filled: {market_slug} | {outcome} | "
+                    f"shares={cum_qty:.2f} | order_id={order_id}"
+                )
+                self._pending_buy_orders.pop(order_id, None)
+                continue
+
+            if state in terminal_states:
+                logger.warning(
+                    f"Pending BUY closed without fill: {market_slug} | {outcome} | order_id={order_id} | state={state}"
+                )
+                self._pending_buy_orders.pop(order_id, None)
+                continue
+
+            checks = int(record.get("checks") or 0) + 1
+            record["checks"] = checks
+            record["next_check_at"] = now + timedelta(seconds=max(5, Config.BUY_PENDING_RECHECK_SECONDS))
+            self._pending_buy_orders[order_id] = record
 
     async def _get_copied_position_shares(
         self,
@@ -180,20 +448,29 @@ class TestTradingBot:
             logger.warning("No traders selected during refresh")
             return
 
-        logger.info(f"Monitoring {len(self.selected_traders)} traders")
-        for trader in self.selected_traders:
+        selected_at_epoch = datetime.now(timezone.utc).timestamp()
+        for index, trader in enumerate(self.selected_traders, start=1):
             wallet = trader.get("wallet")
             if not wallet:
                 continue
 
             wallet_key = str(wallet).strip().lower()
+            self._startup_bootstrap_pending_wallets.add(wallet_key)
+            self._selected_at_by_wallet_epoch[wallet_key] = selected_at_epoch
+            self.trade_monitor.set_bootstrap_mode(wallet_key, True)
             display_name = str(trader.get("display_name") or "").strip()
             if wallet_key and display_name:
                 self._trader_display_names[wallet_key] = display_name
                 self.trade_monitor.set_wallet_label(wallet_key, display_name)
 
+            logger.info(
+                f"Selected trader {index}: {self._trader_label(wallet)} | wallet={wallet_key}"
+            )
+
             historical = await self.api_client.get_user_trades(wallet=wallet, limit=Config.TRADE_PAGE_SIZE)
             self.trade_monitor.initialize_wallet(wallet, historical)
+
+        logger.info(f"Monitoring {len(self.selected_traders)} traders")
     
     async def start(self):
         """Start the bot in test mode."""
@@ -214,11 +491,6 @@ class TestTradingBot:
         
         # Get position summary
         summary = self.position_manager.get_summary()
-        logger.info(
-            f"Position summary: {summary['total_positions']} positions, "
-            f"${summary['total_invested']:.2f} invested, "
-            f"${summary['available']:.2f} available"
-        )
         
         # Select top traders
         logger.info("Selecting top traders...")
@@ -258,6 +530,7 @@ class TestTradingBot:
         wallet = trader.get("wallet")
         if not wallet:
             return
+        wallet_key = str(wallet).strip().lower()
 
         async with semaphore:
             trades = await self.trade_monitor.get_new_trades(wallet)
@@ -265,9 +538,32 @@ class TestTradingBot:
         if not trades:
             return
 
+        trades = self._filter_startup_history_trades(trades, wallet_key)
+        if not trades:
+            return
+
         logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)}")
+        trades = self._filter_largest_buy_per_cycle(trades, wallet)
+
+        trade_key_counts: dict[str, int] = {}
         for trade in trades:
-            await self._process_trade(trade, wallet)
+            market_key = str(trade.get("market_slug") or "").strip().lower()
+            outcome_key = str(trade.get("outcome") or "").strip().lower()
+            if not market_key or not outcome_key:
+                continue
+            combined_key = f"{market_key}|{outcome_key}"
+            trade_key_counts[combined_key] = trade_key_counts.get(combined_key, 0) + 1
+
+        for market_key, count in trade_key_counts.items():
+            if count >= Config.POTENTIAL_DUPLICATE_ALERT_THRESHOLD:
+                logger.warning(
+                    f"Possible duplicate trade processing detected: {market_key} | "
+                    f"Count={count} trades in single poll | Trader={self._trader_label(wallet)}"
+                )
+
+        unavailable_markets_logged: set[str] = set()
+        for trade in trades:
+            await self._process_trade(trade, wallet, unavailable_markets_logged)
 
     async def _trade_poll_loop(self):
         """High-frequency tracked-account polling loop (test mode)."""
@@ -301,6 +597,8 @@ class TestTradingBot:
         """Slower maintenance loop for balance/position reporting (test mode)."""
         while self.running:
             try:
+                await self._reconcile_pending_buys()
+
                 summary = self.position_manager.get_summary()
                 logger.info(
                     f"Balance: ${self.position_manager.balance:.2f} | "
@@ -339,7 +637,12 @@ class TestTradingBot:
 
             await asyncio.sleep(max(1, Config.SCAN_INTERVAL_SECONDS))
     
-    async def _process_trade(self, trade: dict, trader_wallet: str):
+    async def _process_trade(
+        self,
+        trade: dict,
+        trader_wallet: str,
+        unavailable_markets_logged: set[str] | None = None,
+    ):
         """
         Process a monitored trader's trade.
         
@@ -362,7 +665,8 @@ class TestTradingBot:
             
             # Keep test mode behavior aligned with live-mode US constraints.
             if not is_sports_market(market_slug):
-                logger.debug(f"Skipping non-sports market: {market_slug}")
+                if not self._is_non_sports_market_cached(market_slug):
+                    self._cache_non_sports_market(market_slug)
                 return
 
             # Handle based on side
@@ -377,6 +681,8 @@ class TestTradingBot:
                     trader_wallet,
                     observed_price=observed_price if observed_price > 0 else None,
                     observed_size=observed_size if observed_size > 0 else None,
+                    largest_buy_meta=trade.get("_largest_buy_filter_meta"),
+                    unavailable_markets_logged=unavailable_markets_logged,
                 )
             elif side_upper == "SELL":
                 observed_size = to_float(trade.get("size"), default=0.0)
@@ -397,6 +703,8 @@ class TestTradingBot:
         trader_wallet: str,
         observed_price: float | None = None,
         observed_size: float | None = None,
+        largest_buy_meta: dict[str, Any] | None = None,
+        unavailable_markets_logged: set[str] | None = None,
     ):
         """
         Handle a BUY signal from monitored trader.
@@ -426,10 +734,10 @@ class TestTradingBot:
                 return
 
         if self._is_us_market_temporarily_untradable(market_slug):
-            reasons = self._us_untradable_reasons.get(market_slug) or []
-            logger.info(
-                f"Skipping BUY for temporarily cached US-untradable market: {market_slug} | "
-                f"reasons={reasons}"
+            self._log_unavailable_market_once(
+                market_slug,
+                "unavailable_us_cached",
+                unavailable_markets_logged,
             )
             return
 
@@ -442,10 +750,10 @@ class TestTradingBot:
         accepting_orders = bool(market_info.get("acceptingOrders", True))
         if market_closed or not accepting_orders:
             reasons = ["MARKET_CLOSED"] if market_closed else ["NOT_TRADABLE"]
-            self._mark_us_market_untradable(market_slug, reasons=reasons)
-            logger.info(
-                f"Skipping BUY for unavailable market: {market_slug} | "
-                f"closed={market_closed} | acceptingOrders={accepting_orders}"
+            self._mark_us_market_untradable(
+                market_slug,
+                reasons=reasons,
+                unavailable_markets_logged=unavailable_markets_logged,
             )
             return
 
@@ -512,6 +820,15 @@ class TestTradingBot:
         target_shares = investment_amount / executable_buy_price
         effective_observed_price = observed_price if (observed_price and observed_price > 0) else current_buy_price
 
+        if largest_buy_meta and to_float(largest_buy_meta.get("filtered_count"), default=0.0) > 0:
+            logger.info(
+                f"Largest BUY selected for cycle: {largest_buy_meta.get('market_slug')} | "
+                f"{largest_buy_meta.get('outcome')} | "
+                f"kept_size={to_float(largest_buy_meta.get('kept_size'), default=0.0):.4f} | "
+                f"filtered={int(to_float(largest_buy_meta.get('filtered_count'), default=0.0))} | "
+                f"trader={largest_buy_meta.get('trader_label') or self._trader_label(trader_wallet)}"
+            )
+
         logger.info(
             f"Processing BUY (SIM): {market_slug} | {outcome.upper()} | "
             f"Trader: {self._trader_label(trader_wallet)} | ${effective_observed_price:.4f}"
@@ -528,7 +845,36 @@ class TestTradingBot:
             reasons = result.get("market_unavailable_reasons") or []
             definitive_reasons = {"MARKET_NOT_FOUND", "NOT_TRADABLE", "ASSET_NOT_FOUND"}
             if any(r in definitive_reasons for r in reasons):
-                self._mark_us_market_untradable(market_slug, reasons=reasons)
+                self._mark_us_market_untradable(
+                    market_slug,
+                    reasons=reasons,
+                    unavailable_markets_logged=unavailable_markets_logged,
+                )
+            else:
+                self._log_unavailable_market_once(
+                    market_slug,
+                    "unavailable_us_nondefinitive",
+                    unavailable_markets_logged,
+                )
+            return
+
+        if result and result.get("submitted") and result.get("reason") == "BUY_PENDING":
+            pending_order_id = str(result.get("order_id") or "").strip()
+            if pending_order_id:
+                self._track_pending_buy(
+                    pending_order_id,
+                    {
+                        "market_slug": market_slug,
+                        "outcome": normalized_outcome,
+                        "trader_wallet": trader_wallet,
+                        "target_shares": target_shares,
+                        "current_price": to_float(result.get("current_price"), default=current_buy_price),
+                    },
+                )
+            logger.info(
+                f"Copied BUY submitted; awaiting reconciliation: {market_slug} | {normalized_outcome} | "
+                f"order_id={pending_order_id or 'UNKNOWN'} | state={result.get('state') or 'UNKNOWN'}"
+            )
             return
 
         if not (result and result.get("success")):
