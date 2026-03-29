@@ -64,6 +64,7 @@ class LiveTradingBot:
         self.selected_traders: list[dict] = []
         self._last_trader_refresh: datetime | None = None
         self._us_untradable_until: dict[str, datetime] = {}
+        self._us_untradable_reasons: dict[str, list[str]] = {}
 
     def _is_us_market_temporarily_untradable(self, market_slug: str) -> bool:
         expires_at = self._us_untradable_until.get(market_slug)
@@ -71,22 +72,34 @@ class LiveTradingBot:
             return False
         if datetime.now(timezone.utc) >= expires_at:
             self._us_untradable_until.pop(market_slug, None)
+            self._us_untradable_reasons.pop(market_slug, None)
             return False
         return True
 
-    def _mark_us_market_untradable(self, market_slug: str):
-        ttl_seconds = max(1, int(Config.US_UNTRADABLE_CACHE_SECONDS))
+    def _mark_us_market_untradable(self, market_slug: str, reasons: list[str] | None = None):
+        base_ttl = max(1, int(Config.US_UNTRADABLE_CACHE_SECONDS))
+        reason_set = {str(r or "").strip().upper() for r in (reasons or []) if str(r or "").strip()}
+
+        # Market-not-found can be transient due to slug-variant mismatches.
+        # Use shorter cache to avoid long false-negative lockouts.
+        if reason_set and reason_set <= {"MARKET_NOT_FOUND"}:
+            ttl_seconds = min(base_ttl, 120)
+        else:
+            ttl_seconds = base_ttl
+
         expires_at = datetime.now(timezone.utc).replace(microsecond=0)
         expires_at = expires_at + timedelta(seconds=ttl_seconds)
         self._us_untradable_until[market_slug] = expires_at
+        self._us_untradable_reasons[market_slug] = sorted(reason_set)
         logger.info(
             f"Caching US-untradable market for {ttl_seconds}s: {market_slug} "
-            f"(until {expires_at.isoformat()})"
+            f"(until {expires_at.isoformat()}) | reasons={sorted(reason_set)}"
         )
 
     def _clear_us_market_untradable(self, market_slug: str):
         if market_slug in self._us_untradable_until:
             self._us_untradable_until.pop(market_slug, None)
+            self._us_untradable_reasons.pop(market_slug, None)
             logger.info(f"Removed US-untradable cache for market: {market_slug}")
 
     async def _refresh_selected_traders(self):
@@ -414,19 +427,12 @@ class LiveTradingBot:
             return
 
         if self._is_us_market_temporarily_untradable(market_slug):
-            # Revalidate cached-untradable markets to recover quickly from false negatives.
-            probe_price = await self.api_client.get_best_price(market_slug, "buy", normalized_outcome)
-            if probe_price and probe_price > 0:
-                self._clear_us_market_untradable(market_slug)
-                logger.info(
-                    f"US market cache revalidated as tradable: {market_slug} | {normalized_outcome} | "
-                    f"price=${probe_price:.4f}"
-                )
-            else:
-                logger.info(
-                    f"Skipping BUY for temporarily cached US-untradable market: {market_slug}"
-                )
-                return
+            reasons = self._us_untradable_reasons.get(market_slug) or []
+            logger.info(
+                f"Skipping BUY for temporarily cached US-untradable market: {market_slug} | "
+                f"reasons={reasons}"
+            )
+            return
 
         self.position_manager.reconcile_outcome_alias(
             market_slug=market_slug,
@@ -484,6 +490,18 @@ class LiveTradingBot:
             return
 
         target_shares = investment_amount / current_buy_price
+        # US API limit prices are cent-based in this integration path; sub-penny
+        # quotes would be rounded/floored to $0.01 during order placement.
+        # Size from executable price floor to prevent accidental notional blowups
+        # (for example sizing at $0.002 but executing at $0.01).
+        executable_buy_price = max(0.01, current_buy_price)
+        if executable_buy_price > current_buy_price:
+            logger.warning(
+                f"Adjusted BUY sizing to executable price floor: {market_slug} | {normalized_outcome} | "
+                f"book=${current_buy_price:.4f} -> exec_floor=${executable_buy_price:.4f}"
+            )
+
+        target_shares = investment_amount / executable_buy_price
         effective_observed_price = observed_price if (observed_price and observed_price > 0) else current_buy_price
 
         logger.info(
@@ -503,12 +521,19 @@ class LiveTradingBot:
             reasons = result.get("market_unavailable_reasons") or []
             definitive_reasons = {"MARKET_NOT_FOUND", "NOT_TRADABLE", "ASSET_NOT_FOUND"}
             if any(r in definitive_reasons for r in reasons):
-                self._mark_us_market_untradable(market_slug)
+                self._mark_us_market_untradable(market_slug, reasons=reasons)
             else:
                 logger.info(
                     f"US market unavailable was non-definitive; not caching: {market_slug} | "
                     f"reasons={reasons}"
                 )
+            return
+
+        if result and result.get("submitted") and result.get("reason") == "BUY_UNFILLED":
+            logger.warning(
+                f"Copied BUY submitted but not filled yet: {market_slug} | {normalized_outcome} | "
+                f"order_id={result.get('order_id')} | state={result.get('state') or 'UNKNOWN'}"
+            )
             return
         
         if result and result.get("success"):
@@ -693,15 +718,20 @@ class LiveTradingBot:
             allow_full_liquidation_on_oversell=True,
             treat_as_market=True,
         )
+
+        if result and result.get("skipped") and result.get("reason") == "IOC_UNFILLED":
+            logger.warning(
+                f"Copied SELL did not execute (IOC unfilled): {market_slug} | {normalized_outcome} | "
+                f"requested={shares_to_sell:.2f} | order_ids={result.get('order_ids') or []}"
+            )
+            return
         
         if result and result.get("success"):
             exit_price = to_float(result.get("price"), default=0.0)
             sold_shares = to_float(result.get("shares"), default=shares_to_sell)
 
-            # SELL placement does not guarantee immediate fill. Local position state
-            # is reconciled from API during sync/fill monitoring.
             logger.info(
-                f"Copied SELL submitted (market-style IOC): {market_slug} | {normalized_outcome} | "
+                f"Copied SELL executed (market-style IOC): {market_slug} | {normalized_outcome} | "
                 f"{sold_shares:.2f} shares @ ${exit_price:.4f}"
             )
 
@@ -712,7 +742,7 @@ class LiveTradingBot:
                 side="SELL",
                 shares=sold_shares if sold_shares > 0 else shares_to_sell,
                 price=exit_price if exit_price > 0 else 0.0,
-                status="submitted",
+                status="executed",
             )
             if self.google_tracker:
                 self.google_tracker.log_trade(

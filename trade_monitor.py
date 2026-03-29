@@ -83,8 +83,7 @@ class TradeMonitor:
             logger.exception(f"Error collecting trades for {wallet[:8]}: {e}")
             return []
 
-    @staticmethod
-    def _normalize_trade(trade: dict[str, Any]) -> dict[str, Any]:
+    def _normalize_trade(self, trade: dict[str, Any]) -> dict[str, Any]:
         """Normalize raw API trade payload to internal bot shape."""
         side_raw = str(trade.get("side") or trade.get("type") or "").strip().upper()
         if side_raw in ("B", "BUY", "BOUGHT"):
@@ -100,6 +99,15 @@ class TradeMonitor:
             or trade.get("slug")
             or trade.get("eventSlug")
         )
+        original_market_slug = market_slug
+
+        if market_slug and self.slug_converter is not None:
+            learned = self.slug_converter.get_learned_mapping(str(market_slug))
+            if learned and str(learned).strip().lower() != str(market_slug).strip().lower():
+                logger.info(
+                    f"Applied learned slug mapping for incoming trade: {market_slug} -> {learned}"
+                )
+                market_slug = learned
         
         # Log full trade object for debugging unknown market slugs
         if market_slug and not any(x in str(market_slug).lower() for x in ["nba", "nhl", "nfl", "mlb", "ncaab", "ncaaf"]):
@@ -109,6 +117,7 @@ class TradeMonitor:
         return {
             **trade,
             "market_slug": market_slug,
+            "original_market_slug": original_market_slug,
             "outcome": trade.get("outcome"),
             "side": side,
             "price": trade.get("price"),

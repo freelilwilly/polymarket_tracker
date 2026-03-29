@@ -20,6 +20,7 @@ import aiohttp
 from cryptography.hazmat.primitives.asymmetric import ed25519
 
 from config import Config
+from slug_converter import SlugConverter
 from utils import resolve_outcome_index, to_float
 
 logger = logging.getLogger(__name__)
@@ -27,11 +28,22 @@ logger = logging.getLogger(__name__)
 
 class PolymarketAPIClient:
     """Client for interacting with Polymarket APIs."""
+
+    TEAM_ABBREVIATION_MAP: dict[str, str] = {
+        "phx": "pho",
+        "gnb": "gb",
+        "kan": "kc",
+        "nwe": "ne",
+        "nor": "no",
+        "sfo": "sf",
+        "tam": "tb",
+    }
     
     def __init__(self):
         """Initialize API client."""
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_order_error: Optional[dict[str, Any]] = None
+        self.slug_converter = SlugConverter()
         
         # US Trading Platform endpoints
         self.us_api_base = Config.US_API_BASE_URL
@@ -64,6 +76,103 @@ class PolymarketAPIClient:
             except Exception as e:
                 # Do not raise here so test mode can run with placeholder values.
                 logger.warning(f"Failed to parse API credentials; authenticated endpoints disabled: {e}")
+
+    @staticmethod
+    def _normalize_slug_value(slug: str) -> str:
+        value = str(slug or "").strip().lower()
+        if value.startswith("aec-"):
+            return value[4:]
+        return value
+
+    @staticmethod
+    def _with_aec_prefix(slug: str) -> str:
+        value = str(slug or "").strip().lower()
+        if value.startswith("aec-"):
+            return value
+        return f"aec-{value}"
+
+    def _apply_team_abbreviation_map(self, slug: str) -> str:
+        base = self._normalize_slug_value(slug)
+        if not base:
+            return ""
+
+        segments = base.split("-")
+        transformed = [self.TEAM_ABBREVIATION_MAP.get(seg, seg) for seg in segments]
+        return "-".join(transformed)
+
+    def _generate_slug_candidates(self, market_slug: str) -> list[str]:
+        """Generate deterministic slug candidates for metadata and US order endpoints."""
+        base = self._normalize_slug_value(market_slug)
+        if not base:
+            return []
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+
+        def _add(value: str):
+            candidate = str(value or "").strip().lower()
+            if not candidate or candidate in seen:
+                return
+            seen.add(candidate)
+            ordered.append(candidate)
+
+        # Start with raw base and preferred US prefix variant.
+        _add(base)
+        _add(self._with_aec_prefix(base))
+
+        # Learned EU -> US slug mapping should be attempted early.
+        learned = self.slug_converter.get_learned_mapping(base)
+        if learned:
+            learned_base = self._normalize_slug_value(learned)
+            _add(learned_base)
+            _add(self._with_aec_prefix(learned_base))
+
+        # Deterministic abbreviation substitution fallback.
+        mapped = self._apply_team_abbreviation_map(base)
+        if mapped and mapped != base:
+            _add(mapped)
+            _add(self._with_aec_prefix(mapped))
+
+        # If learned mapping also has additional abbreviations, include it too.
+        if learned:
+            mapped_learned = self._apply_team_abbreviation_map(learned)
+            if mapped_learned:
+                _add(mapped_learned)
+                _add(self._with_aec_prefix(mapped_learned))
+
+        return ordered[:8]
+
+    @staticmethod
+    def _extract_error_message(raw_text: str) -> str:
+        text = str(raw_text or "")
+        if not text:
+            return ""
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                message = payload.get("message") or payload.get("error")
+                if message:
+                    return str(message)
+        except Exception:
+            pass
+        return text
+
+    @staticmethod
+    def _is_market_not_found_error(error: Any) -> bool:
+        if isinstance(error, dict):
+            raw = str(error.get("message") or error.get("raw_message") or "")
+        else:
+            raw = str(error or "")
+        value = raw.lower()
+        patterns = (
+            "market not found",
+            "market does not exist",
+            "no such market",
+            "unknown market",
+            "asset not found",
+            "conditionid not found",
+        )
+        return any(p in value for p in patterns)
     
     async def initialize(self):
         """Initialize HTTP session."""
@@ -262,9 +371,11 @@ class PolymarketAPIClient:
                         return payload, None
 
                     text = await response.text()
+                    parsed_message = self._extract_error_message(text)
                     last_error = {
                         "status": response.status,
-                        "message": text,
+                        "message": parsed_message,
+                        "raw_message": text,
                         "url": url,
                     }
 
@@ -278,7 +389,7 @@ class PolymarketAPIClient:
                         continue
 
                     # Suppress "market not found" warnings - these are handled by slug retry logic in place_order
-                    is_market_not_found = "market not found" in text.lower()
+                    is_market_not_found = self._is_market_not_found_error(last_error)
                     if not is_market_not_found:
                         logger.warning(
                             f"Request failed: POST {url} -> {response.status}: {text}"
@@ -442,15 +553,7 @@ class PolymarketAPIClient:
         Returns:
             Market info dict or None
         """
-        # Always try both aec-<slug> and <slug> for US markets
-        # Use query parameter instead of path parameter to avoid validation errors
-        candidate_slugs = [market_slug]
-        if market_slug.startswith("aec-"):
-            # If slug already has aec- prefix, also try without it
-            candidate_slugs.append(market_slug[4:])  # Remove "aec-" prefix
-        else:
-            # If slug doesn't have prefix, also try with it
-            candidate_slugs.append(f"aec-{market_slug}")
+        candidate_slugs = self._generate_slug_candidates(market_slug)
         
         data = None
         for candidate_slug in candidate_slugs:
@@ -775,6 +878,7 @@ class PolymarketAPIClient:
         price: float,
         tif: str = "TIME_IN_FORCE_GOOD_TILL_CANCEL",
         order_type: str = "ORDER_TYPE_LIMIT",
+        convert_no_price: bool = True,
     ) -> Optional[dict[str, Any]]:
         """
         Place an order via US API.
@@ -806,14 +910,12 @@ class PolymarketAPIClient:
 
         side_upper = side.upper()
 
-        # Always try both aec-<slug> and <slug> for US API
-        candidate_slugs = [market_slug]
-        if market_slug.startswith("aec-"):
-            # If slug already has aec- prefix, also try without it
-            candidate_slugs.append(market_slug[4:])  # Remove "aec-" prefix
-        else:
-            # If slug doesn't have prefix, also try with it
-            candidate_slugs.append(f"aec-{market_slug}")
+        candidate_slugs = self._generate_slug_candidates(market_slug)
+        if not candidate_slugs:
+            logger.warning(f"Cannot place order with empty market slug: {market_slug}")
+            return None
+
+        input_slug_base = self._normalize_slug_value(market_slug)
 
         last_market_not_found_error = None
         for candidate_slug in candidate_slugs:
@@ -830,7 +932,7 @@ class PolymarketAPIClient:
                 else:
                     order_intent = "ORDER_INTENT_SELL_SHORT"
 
-            if outcome_lower == "no":
+            if outcome_lower == "no" and convert_no_price:
                 adj_price = max(0.01, min(0.99, 1.0 - price))
             else:
                 adj_price = max(0.01, min(0.99, price))
@@ -879,9 +981,19 @@ class PolymarketAPIClient:
                 if order_id:
                     # Log the full result to see what the API actually returned
                     logger.debug(f"Order placed - Full API response: {result}")
-                    return {"order_id": order_id, "result": result}
+                    used_slug_base = self._normalize_slug_value(candidate_slug)
+                    if used_slug_base and used_slug_base != input_slug_base:
+                        self.slug_converter.learn_mapping(input_slug_base, used_slug_base)
+                        logger.info(
+                            f"Learned slug mapping from successful order: {input_slug_base} -> {used_slug_base}"
+                        )
+                    return {
+                        "order_id": order_id,
+                        "result": result,
+                        "market_slug_used": candidate_slug,
+                    }
             # If market not found, try next candidate
-            if order_error and "market not found" in str(order_error.get("message", "")).lower():
+            if order_error and self._is_market_not_found_error(order_error):
                 last_market_not_found_error = order_error
                 continue
             # For other errors, break
@@ -889,6 +1001,8 @@ class PolymarketAPIClient:
         
         # If all candidates failed with "market not found", log warning
         if last_market_not_found_error:
+            last_market_not_found_error["candidate_slugs"] = candidate_slugs
+            self.last_order_error = last_market_not_found_error
             logger.warning(
                 f"Market not available on US API (tried {candidate_slugs}): {market_slug}"
             )

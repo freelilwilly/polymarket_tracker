@@ -469,6 +469,7 @@ class PositionManager:
         # We'll handle legacy key matching separately during the update phase
         api_lookup: dict[str, dict[str, Any]] = {}
         api_positions_by_market: dict[str, dict[str, Any]] = {}  # For matching: "market|outcome" -> position
+        api_positions_by_market_only: dict[str, list[dict[str, Any]]] = {}
         
         for api_pos in api_positions:
             market_slug = api_pos.get("marketSlug") or api_pos.get("market_slug")
@@ -522,6 +523,8 @@ class PositionManager:
             api_positions_by_market[market_id_normalized] = position_data
             if market_id_raw != market_id_normalized:
                 api_positions_by_market[market_id_raw] = position_data
+
+            api_positions_by_market_only.setdefault(normalized_market, []).append(position_data)
         
         # Track which API positions have been matched to local positions
         # to prevent duplicate imports
@@ -559,6 +562,17 @@ class PositionManager:
                 if market_id_alt in api_positions_by_market:
                     found_in_api = True
                     api_data = api_positions_by_market[market_id_alt]
+                    matched_key = self.get_position_key(api_data["market_slug"], api_data["outcome"])
+                    matched_api_positions.add(matched_key)
+
+            # Strategy 4: Conservative market-only fallback.
+            # If there is exactly one API position for the market, treat it as a match
+            # even when outcome normalization failed, to avoid false local closure.
+            if not found_in_api:
+                market_only = api_positions_by_market_only.get(local_market) or []
+                if len(market_only) == 1:
+                    found_in_api = True
+                    api_data = market_only[0]
                     matched_key = self.get_position_key(api_data["market_slug"], api_data["outcome"])
                     matched_api_positions.add(matched_key)
             
@@ -602,6 +616,14 @@ class PositionManager:
                 market_id_alt = f"{alt_market}|{local_outcome}"
                 if market_id_alt in api_positions_by_market:
                     api_data = api_positions_by_market[market_id_alt]
+                    matched_api_key = self.get_position_key(api_data["market_slug"], api_data["outcome"])
+                    matched_api_positions.add(matched_api_key)
+
+            # Strategy 4: Conservative market-only fallback.
+            if not api_data:
+                market_only = api_positions_by_market_only.get(local_market) or []
+                if len(market_only) == 1:
+                    api_data = market_only[0]
                     matched_api_key = self.get_position_key(api_data["market_slug"], api_data["outcome"])
                     matched_api_positions.add(matched_api_key)
             

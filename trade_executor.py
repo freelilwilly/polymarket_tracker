@@ -1,4 +1,5 @@
 """Trade execution logic with price validation."""
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -161,6 +162,13 @@ class TradeExecutor:
                 return {"skipped": True, "reason": "NO_SIDE_DISABLED"}
             
             # Place order via US API
+            order_price_preview = max(0.01, min(0.99, current_price))
+            if order_price_preview > current_price:
+                logger.warning(
+                    f"BUY order price floor applied by US API path: {market_slug} | "
+                    f"quoted=${current_price:.4f} -> order=${order_price_preview:.4f}"
+                )
+
             order_result = await self.api_client.place_order(
                 market_slug=market_slug,
                 outcome=normalized_outcome,
@@ -173,9 +181,10 @@ class TradeExecutor:
                 order_error = self.api_client.last_order_error or {}
                 status = order_error.get("status")
                 message = str(order_error.get("message") or "").lower()
+                candidate_slugs = order_error.get("candidate_slugs") or []
 
                 market_unavailable_reasons = []
-                if "market not found" in message:
+                if self.api_client._is_market_not_found_error(order_error):
                     market_unavailable_reasons.append("MARKET_NOT_FOUND")
                 if "not tradable" in message:
                     market_unavailable_reasons.append("NOT_TRADABLE")
@@ -194,21 +203,105 @@ class TradeExecutor:
                         "reason": "US_MARKET_UNAVAILABLE",
                         "status": status,
                         "market_unavailable_reasons": market_unavailable_reasons,
+                        "candidate_slugs": candidate_slugs,
                     }
 
                 logger.warning(f"Order placement failed for {market_slug}")
                 return None
+
+            order_id = order_result.get("order_id")
+
+            async def _fetch_buy_execution(order_id_value: str) -> dict[str, Any]:
+                """Poll order details briefly and return buy execution summary."""
+                last_details: Optional[dict[str, Any]] = None
+                for _ in range(4):
+                    details = await self.api_client.get_order_details(order_id_value)
+                    if isinstance(details, dict):
+                        last_details = details
+                        state = str(
+                            details.get("state")
+                            or details.get("status")
+                            or details.get("orderState")
+                            or ""
+                        ).upper()
+                        if state in {
+                            "ORDER_STATE_FILLED",
+                            "FILLED",
+                            "ORDER_STATE_PARTIALLY_FILLED",
+                            "PARTIALLY_FILLED",
+                            "ORDER_STATE_CANCELLED",
+                            "CANCELLED",
+                            "CANCELED",
+                            "ORDER_STATE_EXPIRED",
+                            "EXPIRED",
+                            "ORDER_STATE_REJECTED",
+                            "REJECTED",
+                        }:
+                            break
+                    await asyncio.sleep(0.35)
+
+                details = last_details or {}
+                state = str(
+                    details.get("state") or details.get("status") or details.get("orderState") or ""
+                ).upper()
+
+                cum_data = (
+                    details.get("cumQuantity")
+                    or details.get("cumQty")
+                    or details.get("filledQuantity")
+                    or details.get("executedQuantity")
+                    or 0
+                )
+                if isinstance(cum_data, dict):
+                    cum_qty = to_float(cum_data.get("value"), default=0.0)
+                else:
+                    cum_qty = to_float(cum_data, default=0.0)
+
+                avg_data = details.get("avgPx") or details.get("avgPrice") or details.get("averagePrice") or 0
+                if isinstance(avg_data, dict):
+                    avg_px = to_float(avg_data.get("value"), default=0.0)
+                else:
+                    avg_px = to_float(avg_data, default=0.0)
+
+                return {
+                    "state": state,
+                    "cum_qty": max(0.0, cum_qty),
+                    "avg_px": max(0.0, avg_px),
+                }
+
+            execution = {"state": "", "cum_qty": 0.0, "avg_px": 0.0}
+            if order_id:
+                execution = await _fetch_buy_execution(str(order_id))
+
+            filled_qty = to_float(execution.get("cum_qty"), default=0.0)
+            avg_fill_px = to_float(execution.get("avg_px"), default=0.0)
+            order_state = str(execution.get("state") or "")
+
+            if filled_qty <= 0:
+                logger.warning(
+                    f"BUY submitted but unfilled so far: {market_slug} | order_id={order_id} | "
+                    f"state={order_state or 'UNKNOWN'}"
+                )
+                return {
+                    "submitted": True,
+                    "reason": "BUY_UNFILLED",
+                    "order_id": order_id,
+                    "state": order_state,
+                    "shares": 0.0,
+                    "current_price": current_price,
+                }
             
             logger.info(
-                f"BUY executed: {market_slug} | {target_shares:.2f} shares "
-                f"@ {current_price:.4f}"
+                f"BUY executed: {market_slug} | {filled_qty:.2f}/{target_shares:.2f} shares "
+                f"@ {(avg_fill_px if avg_fill_px > 0 else current_price):.4f} | order_id={order_id}"
             )
             
             return {
                 "success": True,
-                "current_price": current_price,
-                "shares": target_shares,
-                "order_id": order_result.get("order_id"),
+                "current_price": avg_fill_px if avg_fill_px > 0 else current_price,
+                "shares": filled_qty,
+                "order_id": order_id,
+                "state": order_state,
             }
             
         except Exception as e:
@@ -222,7 +315,7 @@ class TradeExecutor:
         outcome: str,
         price: Optional[float] = None,
         allow_full_liquidation_on_oversell: bool = False,
-        treat_as_market: bool = False,
+        treat_as_market: bool = True,
     ) -> Optional[dict[str, Any]]:
         """
         Execute a SELL order.
@@ -274,19 +367,16 @@ class TradeExecutor:
                 logger.warning(f"Could not normalize outcome '{outcome}' for {market_slug}")
                 return {"skipped": True, "reason": "OUTCOME_NORMALIZATION_FAILED"}
             
-            # Determine price. For market-style copied sells, use aggressive IOC limits
-            # so the order is marketable on the US matching venue even if public CLOB
-            # quotes diverge from executable US liquidity.
-            if price is None:
-                if treat_as_market:
-                    price = 0.01 if normalized_outcome.lower() == "yes" else 0.99
-                else:
-                    price = await self.api_client.get_best_price(
-                        market_slug, side="sell", outcome=normalized_outcome
-                    )
-                    if price is None:
-                        logger.warning(f"Could not get sell price for {market_slug}")
-                        return {"skipped": True, "reason": "NO_PRICE"}
+            if not treat_as_market:
+                logger.warning(
+                    f"Non-market copied SELL blocked: {market_slug} | {normalized_outcome}. "
+                    f"Copied sells must be IOC market-style orders."
+                )
+                return {"skipped": True, "reason": "NON_MARKET_SELL_BLOCKED"}
+
+            # Copied SELLs are market-only: force aggressive IOC limits and ignore
+            # caller-provided limit prices so orders cannot rest on the book.
+            price = 0.01 if normalized_outcome.lower() == "yes" else 0.99
             
             # In test mode, just return success
             if self.test_mode:
@@ -299,22 +389,159 @@ class TradeExecutor:
                     "price": price,
                     "shares": shares,
                 }
+
+            async def _fetch_order_execution(order_id: str) -> dict[str, Any]:
+                """Poll a fresh IOC order briefly and return execution summary."""
+                last_details: Optional[dict[str, Any]] = None
+                for _ in range(4):
+                    details = await self.api_client.get_order_details(order_id)
+                    if isinstance(details, dict):
+                        last_details = details
+                        state = str(
+                            details.get("state")
+                            or details.get("status")
+                            or details.get("orderState")
+                            or ""
+                        ).upper()
+                        if state in {
+                            "ORDER_STATE_FILLED",
+                            "FILLED",
+                            "ORDER_STATE_EXPIRED",
+                            "EXPIRED",
+                            "ORDER_STATE_CANCELLED",
+                            "CANCELLED",
+                            "CANCELED",
+                            "ORDER_STATE_REJECTED",
+                            "REJECTED",
+                            "ORDER_STATE_PARTIALLY_FILLED",
+                            "PARTIALLY_FILLED",
+                        }:
+                            break
+                    await asyncio.sleep(0.35)
+
+                details = last_details or {}
+                state = str(
+                    details.get("state") or details.get("status") or details.get("orderState") or ""
+                ).upper()
+
+                cum_data = (
+                    details.get("cumQuantity")
+                    or details.get("cumQty")
+                    or details.get("filledQuantity")
+                    or details.get("executedQuantity")
+                    or 0
+                )
+                if isinstance(cum_data, dict):
+                    cum_qty = to_float(cum_data.get("value"), default=0.0)
+                else:
+                    cum_qty = to_float(cum_data, default=0.0)
+
+                avg_data = details.get("avgPx") or details.get("avgPrice") or details.get("averagePrice") or 0
+                if isinstance(avg_data, dict):
+                    avg_px = to_float(avg_data.get("value"), default=0.0)
+                else:
+                    avg_px = to_float(avg_data, default=0.0)
+
+                return {
+                    "state": state,
+                    "cum_qty": max(0.0, cum_qty),
+                    "avg_px": max(0.0, avg_px),
+                }
+
+            async def _submit_ioc(convert_no_price: bool, submit_shares: float, submit_price: float) -> Optional[dict[str, Any]]:
+                """Submit IOC sell and capture immediate execution state."""
+                order_result = await self.api_client.place_order(
+                    market_slug=market_slug,
+                    outcome=normalized_outcome,
+                    side="SELL",
+                    shares=submit_shares,
+                    price=submit_price,
+                    tif="TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+                    order_type="ORDER_TYPE_LIMIT",
+                    convert_no_price=convert_no_price,
+                )
+                if not order_result:
+                    return None
+
+                order_id = order_result.get("order_id")
+                execution = {"state": "", "cum_qty": 0.0, "avg_px": 0.0}
+                if order_id:
+                    execution = await _fetch_order_execution(str(order_id))
+
+                return {
+                    "order_id": order_id,
+                    "execution": execution,
+                }
             
-            # Execute actual sell order (LIVE MODE)
-            tif = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL" if treat_as_market else "TIME_IN_FORCE_GOOD_TILL_CANCEL"
-            order_result = await self.api_client.place_order(
-                market_slug=market_slug,
-                outcome=normalized_outcome,
-                side="SELL",
-                shares=shares,
-                price=price,
-                tif=tif,
-                order_type="ORDER_TYPE_LIMIT",
-            )
-            
-            if not order_result:
-                logger.warning(f"Sell order failed for {market_slug}")
+            # Execute actual sell order (LIVE MODE) as market-style IOC only.
+            tif = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL"
+            total_filled = 0.0
+            weighted_notional = 0.0
+            order_ids: list[str] = []
+
+            first = await _submit_ioc(convert_no_price=True, submit_shares=shares, submit_price=price)
+            if not first:
+                logger.warning(f"Sell IOC failed for {market_slug}")
                 return None
+
+            first_order_id = str(first.get("order_id") or "")
+            if first_order_id:
+                order_ids.append(first_order_id)
+
+            first_exec = first.get("execution") or {}
+            first_filled = to_float(first_exec.get("cum_qty"), default=0.0)
+            first_avg = to_float(first_exec.get("avg_px"), default=0.0)
+            first_state = str(first_exec.get("state") or "")
+
+            if first_filled > 0:
+                total_filled += first_filled
+                weighted_notional += first_filled * (first_avg if first_avg > 0 else price)
+
+            # If NO-side IOC returned unfilled, retry once with non-converted price basis.
+            # Some venues/environments interpret short-side price basis differently.
+            remaining = max(0.0, shares - total_filled)
+            if normalized_outcome.lower() == "no" and total_filled <= 0 and remaining >= 1.0:
+                logger.warning(
+                    f"IOC sell unfilled on first attempt: {market_slug} | state={first_state or 'UNKNOWN'} | "
+                    f"retrying with alternate NO-price basis"
+                )
+                second = await _submit_ioc(convert_no_price=False, submit_shares=remaining, submit_price=price)
+                if second:
+                    second_order_id = str(second.get("order_id") or "")
+                    if second_order_id:
+                        order_ids.append(second_order_id)
+                    second_exec = second.get("execution") or {}
+                    second_filled = to_float(second_exec.get("cum_qty"), default=0.0)
+                    second_avg = to_float(second_exec.get("avg_px"), default=0.0)
+                    if second_filled > 0:
+                        total_filled += second_filled
+                        weighted_notional += second_filled * (second_avg if second_avg > 0 else price)
+
+            if total_filled <= 0:
+                logger.warning(
+                    f"SELL IOC unfilled: {market_slug} | outcome={normalized_outcome} | "
+                    f"requested={shares:.2f} | order_ids={order_ids}"
+                )
+                return {
+                    "skipped": True,
+                    "reason": "IOC_UNFILLED",
+                    "shares": 0.0,
+                    "price": price,
+                    "order_id": order_ids[0] if order_ids else None,
+                    "order_ids": order_ids,
+                }
+
+            avg_fill_price = weighted_notional / total_filled if total_filled > 0 else price
+            logger.info(
+                f"SELL IOC filled: {market_slug} | filled={total_filled:.2f}/{shares:.2f} @ {avg_fill_price:.4f}"
+            )
+            return {
+                "success": True,
+                "price": avg_fill_price,
+                "shares": total_filled,
+                "order_id": order_ids[0] if order_ids else None,
+                "order_ids": order_ids,
+            }
             
             logger.info(
                 f"SELL order accepted: {market_slug} | {shares:.2f} shares @ {price:.4f} | "
