@@ -703,24 +703,28 @@ class PolymarketAPIClient:
                 metadata = metadata if isinstance(metadata, dict) else {}
                 outcome = metadata.get("outcome") or payload.get("outcome") or ""
 
-                # Use available long quantity when provided. If missing, infer from signed
-                # position fields but never treat negative (short) balances as sellable longs.
+                # US API can report side exposure with signed quantities for one outcome
+                # (e.g., netPosition=-100 for the opposite side). For holdings/position
+                # tracking, we need the magnitude of exposure, not the sign.
                 qty_available = to_float(payload.get("qtyAvailable"), default=0.0)
-                if qty_available > 0:
-                    long_size = qty_available
-                else:
-                    signed_size = to_float(
-                        payload.get("size")
-                        if payload.get("size") is not None
-                        else payload.get("netPosition"),
-                        default=0.0,
-                    )
-                    long_size = signed_size if signed_size > 0 else 0.0
-                    if long_size <= 0:
-                        qty_bought = to_float(payload.get("qtyBought"), default=0.0)
-                        long_size = qty_bought if qty_bought > 0 else 0.0
+                signed_size = to_float(
+                    payload.get("size")
+                    if payload.get("size") is not None
+                    else payload.get("netPosition"),
+                    default=0.0,
+                )
+                qty_bought = to_float(payload.get("qtyBought"), default=0.0)
+                qty_sold = to_float(payload.get("qtySold"), default=0.0)
 
-                # DEBUG: Log why positions are being filtered
+                if abs(qty_available) > 0:
+                    long_size = abs(qty_available)
+                elif abs(signed_size) > 0:
+                    long_size = abs(signed_size)
+                else:
+                    # Fallback to net traded quantity when explicit position fields are absent.
+                    long_size = abs(qty_bought - qty_sold)
+
+                # Keep as warning because this can indicate API schema drift or parsing bugs.
                 if long_size <= 0:
                     logger.warning(
                         f"FILTERING OUT POSITION (long_size={long_size:.2f}): market={market_slug}, "
