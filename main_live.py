@@ -131,8 +131,14 @@ class LiveTradingBot:
         if balance is None:
             logger.error("Failed to fetch balance. Exiting.")
             return
-        
-        logger.info(f"Starting balance: ${balance:.2f}")
+
+        buying_power = self.position_manager.buying_power
+        if buying_power is not None:
+            logger.info(
+                f"Starting account value: ${balance:.2f} | Buying power: ${buying_power:.2f}"
+            )
+        else:
+            logger.info(f"Starting account value: ${balance:.2f}")
         
         # Sync positions with API
         await self.position_manager.sync_positions_with_api()

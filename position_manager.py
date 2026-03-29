@@ -77,10 +77,10 @@ class PositionManager:
     
     async def update_balance(self) -> Optional[float]:
         """
-        Fetch and update balance from API.
+        Fetch and update account value from API.
         
         Returns:
-            Current total account value or None on error
+            Current total account value (cash + marked positions) or None on error
         """
         overview = await self.api_client.get_account_overview()
         if overview is not None:
