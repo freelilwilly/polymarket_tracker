@@ -912,7 +912,7 @@ class PolymarketAPIClient:
 
         if not slug:
             # Try without market slug in payload
-            result = await self._post_json(url, {}, auth_required=True)
+            result, _ = await self._post_json_with_meta(url, {}, auth_required=True)
             return result is not None
 
         # Always try both aec-<slug> and <slug> for US API
@@ -924,15 +924,23 @@ class PolymarketAPIClient:
             # If slug doesn't have prefix, also try with it
             candidate_slugs.append(f"aec-{slug}")
 
+        last_error: Optional[dict[str, Any]] = None
         for candidate_slug in candidate_slugs:
             payload: dict[str, Any] = {"marketSlug": candidate_slug}
-            result = await self._post_json(url, payload, auth_required=True)
+            result, cancel_error = await self._post_json_with_meta(url, payload, auth_required=True)
+            if cancel_error:
+                last_error = cancel_error
             
             # US API may return an empty JSON object on successful cancel.
             if result is not None:
                 return True
         
         # All candidates failed
+        if last_error:
+            logger.warning(
+                f"Cancel failed for order {order_id} (tried {candidate_slugs}): "
+                f"status={last_error.get('status')} message={last_error.get('message')}"
+            )
         return False
     
     async def get_orders(self) -> Optional[list[dict[str, Any]]]:

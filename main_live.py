@@ -545,18 +545,69 @@ class LiveTradingBot:
 
         shares_to_sell = held_shares
         if observed_size is not None and observed_size > 0:
-            shares_to_sell = observed_size
+            # IMPORTANT: incoming trade `size` is a trader-size signal (notional-like),
+            # not guaranteed to be literal share quantity on our account.
+            # Mirror BUY sizing behavior for SELLs, then convert notional -> shares.
+            current_sell_price = await self.api_client.get_best_price(market_slug, "sell", normalized_outcome)
+            if current_sell_price and current_sell_price > 0:
+                balance = self.position_manager.balance
+                position_notional = held_shares * current_sell_price
+                sizing_base = balance if (balance is not None and balance > 0) else position_notional
+
+                base_notional = sizing_base * Config.BASE_RISK_PERCENT
+                trade_notional_cap = sizing_base * Config.TAIL_MAX_TRADE_NOTIONAL_PCT
+
+                history = self.trade_monitor.get_size_history(trader_wallet) if trader_wallet else []
+                effective_observed_size = observed_size
+                wallet_median = median(history)
+                percentile = calculate_percentile(history, effective_observed_size) if history else 0.5
+                multiplier = calculate_multiplier(
+                    percentile=percentile,
+                    observed_size=effective_observed_size,
+                    wallet_median_size=wallet_median,
+                    min_multiplier=Config.TAIL_MIN_MULTIPLIER,
+                    max_multiplier=Config.TAIL_MAX_MULTIPLIER,
+                    curve_power=Config.TAIL_MULTIPLIER_CURVE_POWER,
+                    low_size_threshold_ratio=Config.TAIL_LOW_SIZE_THRESHOLD_RATIO,
+                    low_size_haircut_power=Config.TAIL_LOW_SIZE_HAIRCUT_POWER,
+                    low_size_haircut_min_factor=Config.TAIL_LOW_SIZE_HAIRCUT_MIN_FACTOR,
+                )
+
+                normalized_notional = min(base_notional * multiplier, trade_notional_cap)
+
+                # Convert notional budget to shares and cap at live held shares.
+                normalized_shares = normalized_notional / current_sell_price if current_sell_price > 0 else 0.0
+                shares_to_sell = min(held_shares, max(0.0, normalized_shares))
+
+                logger.info(
+                    f"Normalized SELL sizing: {market_slug} | {normalized_outcome} | "
+                    f"observed_size={observed_size:.2f} -> {shares_to_sell:.2f} shares "
+                    f"(held={held_shares:.2f}, px=${current_sell_price:.4f}, mult={multiplier:.3f})"
+                )
+            else:
+                # If we cannot price reliably, avoid using raw observed size as shares.
+                # Fall back to conservative partial liquidation signal handling.
+                shares_to_sell = min(held_shares, held_shares * 0.5)
+                logger.warning(
+                    f"SELL sizing fallback (no current price): {market_slug} | {normalized_outcome} | "
+                    f"selling {shares_to_sell:.2f}/{held_shares:.2f} shares"
+                )
 
         monitored_trader = str(position.get("monitored_trader") or "").strip().lower()
         incoming_trader = str(trader_wallet or "").strip().lower()
         same_trader = bool(monitored_trader and incoming_trader and monitored_trader == incoming_trader)
 
-        if shares_to_sell > held_shares and same_trader:
+        if shares_to_sell > held_shares:
             logger.info(
-                f"Oversell signal from owning trader; liquidating full held size: "
-                f"requested={shares_to_sell:.2f}, held={held_shares:.2f}"
+                f"Oversell signal capped to held size: requested={shares_to_sell:.2f}, held={held_shares:.2f}"
             )
             shares_to_sell = held_shares
+
+        if shares_to_sell <= 0:
+            logger.warning(
+                f"Computed non-positive SELL size for {market_slug} | {normalized_outcome}; skipping"
+            )
+            return
 
         # Cancel liquidation order if exists
         if Config.ENABLE_AUTO_LIQUIDATION:
@@ -572,7 +623,7 @@ class LiveTradingBot:
             market_slug=market_slug,
             shares=shares_to_sell,
             outcome=normalized_outcome,
-            allow_full_liquidation_on_oversell=same_trader,
+            allow_full_liquidation_on_oversell=True,
             treat_as_market=True,
         )
         
