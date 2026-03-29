@@ -89,18 +89,29 @@ class TradeMonitor:
             new_trades: list[dict[str, Any]] = []
             duplicates_filtered = 0
             
+            # Track trades without txHash for monitoring
+            missing_txhash_count = 0
+            
             for trade in trades:
                 t_key = trade_key(trade)
+                
+                # Track missing txHash scenarios
+                if not trade.get("transactionHash") and not trade.get("id"):
+                    missing_txhash_count += 1
+                
                 if t_key not in self.seen_trades[wallet]:
                     new_trades.append(trade)
                     self.seen_trades[wallet].add(t_key)
                     
                     # Log first few trade keys for validation (only in debug mode)
                     if len(new_trades) <= 5:
+                        has_txhash = "✓" if trade.get("transactionHash") else "✗"
                         logger.debug(
                             f"New trade key: {t_key} | "
                             f"market={trade.get('market_slug') or trade.get('asset', 'unknown')} | "
-                            f"outcome={trade.get('outcome', 'unknown')}"
+                            f"outcome={trade.get('outcome', 'unknown')} | "
+                            f"txHash={has_txhash} | "
+                            f"size={trade.get('size', 'N/A')}"
                         )
                 else:
                     duplicates_filtered += 1
@@ -111,6 +122,13 @@ class TradeMonitor:
                 logger.debug(
                     f"Filtered {duplicates_filtered} duplicate(s) from {self._wallet_label(wallet)}: "
                     f"{len(new_trades)} new trade(s) remain"
+                )
+            
+            # Warn if many trades are missing txHash (may indicate API data quality issue)
+            if missing_txhash_count > 5 and len(trades) > 0:
+                logger.warning(
+                    f"{missing_txhash_count}/{len(trades)} trades from {self._wallet_label(wallet)} "
+                    f"missing transactionHash (using size-based deduplication fallback)"
                 )
             
             return new_trades

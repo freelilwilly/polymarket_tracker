@@ -96,15 +96,19 @@ def trade_key(trade: dict[str, Any]) -> str:
     """
     Generate unique key for a trade using immutable fields only.
     
-    Critical: Do NOT include size or price, as these can change during
-    fills/updates and cause the same blockchain transaction to appear
-    as multiple unique trades when returned by the API.
+    Critical balance:
+    - WITH txHash: Don't include size (handles partial fills of same blockchain tx)
+    - WITHOUT txHash: Include size (distinguishes rapid trades on same market)
+    
+    This prevents both issues:
+    1. Same trade with partial fills appearing as duplicates (when txHash exists)
+    2. Rapid legitimate trades being treated as duplicates (when txHash missing)
     """
     trade_id = trade.get("id")
     if trade_id is not None:
         return f"id:{trade_id}"
     
-    # Use immutable fields only: txHash, timestamp, maker/wallet, asset, outcome, side
+    # Extract immutable fields
     tx_hash = trade.get("transactionHash") or ""
     timestamp = trade.get("timestamp") or ""
     maker = trade.get("maker") or trade.get("proxyWallet") or trade.get("wallet") or ""
@@ -112,8 +116,14 @@ def trade_key(trade: dict[str, Any]) -> str:
     outcome = trade.get("outcome") or ""
     side = trade.get("side") or ""
     
-    # Build composite key without volatile size/price fields
-    return f"{tx_hash}:{timestamp}:{maker}:{asset}:{outcome}:{side}"
+    # If txHash exists, use it as primary identifier (don't include size)
+    if tx_hash:
+        return f"{tx_hash}:{timestamp}:{maker}:{asset}:{outcome}:{side}"
+    
+    # If txHash is MISSING, include size to distinguish rapid trades
+    # (e.g., user places $28 and $45 trades 4 seconds apart on same market)
+    size = trade.get("size") or ""
+    return f"NOTX:{timestamp}:{maker}:{asset}:{outcome}:{side}:{size}"
 
 
 def normalize_slug_for_key(slug: Any) -> str:
