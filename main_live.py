@@ -131,20 +131,26 @@ class LiveTradingBot:
         if balance is None:
             logger.error("Failed to fetch balance. Exiting.")
             return
-
-        buying_power = self.position_manager.buying_power
-        if buying_power is not None:
-            logger.info(
-                f"Starting account value: ${balance:.2f} | Buying power: ${buying_power:.2f}"
-            )
-        else:
-            logger.info(f"Starting account value: ${balance:.2f}")
         
         # Sync positions with API
         await self.position_manager.sync_positions_with_api()
+
+        # Use the same equity calculation as the recurring account-status log
+        # so startup values are consistent (cash + live position value).
+        summary = self.position_manager.get_summary()
+        startup_cash = summary.get("buying_power")
+        if startup_cash is None:
+            startup_cash = max(0.0, balance - summary["total_invested"])
+        startup_positions_value = await self.position_manager.get_total_positions_value()
+        startup_equity = startup_cash + startup_positions_value
+        logger.info(
+            f"Starting account: cash=${startup_cash:.2f} | "
+            f"positions=${startup_positions_value:.2f} | "
+            f"equity=${startup_equity:.2f} | "
+            f"{summary['total_positions']} open"
+        )
         
         # Get position summary
-        summary = self.position_manager.get_summary()
         logger.info(
             f"Position summary: {summary['total_positions']} positions, "
             f"${summary['total_invested']:.2f} invested, "
@@ -161,7 +167,7 @@ class LiveTradingBot:
         
         # Log initial state to Excel
         self.excel_tracker.log_balance(
-            balance=balance,
+            balance=startup_equity,
             invested=summary['total_invested'],
             total_positions=summary['total_positions'],
         )
@@ -549,6 +555,32 @@ class LiveTradingBot:
             logger.warning(f"Position has no shares for {market_slug} | {normalized_outcome}, skipping")
             return
 
+        # Safety: copied SELLs should only manage positions that were opened by the
+        # same monitored trader. This prevents cross-trader/cross-side liquidation
+        # and synthetic short creation when API payloads are ambiguous.
+        monitored_trader = str(position.get("monitored_trader") or "").strip().lower()
+        incoming_trader = str(trader_wallet or "").strip().lower()
+
+        if not incoming_trader:
+            logger.warning(
+                f"Skipping SELL with missing trader identity: {market_slug} | {normalized_outcome}"
+            )
+            return
+
+        if not monitored_trader:
+            logger.info(
+                f"Skipping SELL for unlinked/manual position: {market_slug} | {normalized_outcome} | "
+                f"incoming trader={incoming_trader[:8]}..."
+            )
+            return
+
+        if monitored_trader != incoming_trader:
+            logger.info(
+                f"Skipping SELL from non-owning trader: {market_slug} | {normalized_outcome} | "
+                f"position owner={monitored_trader[:8]}..., signal trader={incoming_trader[:8]}..."
+            )
+            return
+
         shares_to_sell = held_shares
         if observed_size is not None and observed_size > 0:
             # IMPORTANT: incoming trade `size` is a trader-size signal (notional-like),
@@ -598,10 +630,6 @@ class LiveTradingBot:
                     f"SELL sizing fallback (no current price): {market_slug} | {normalized_outcome} | "
                     f"selling {shares_to_sell:.2f}/{held_shares:.2f} shares"
                 )
-
-        monitored_trader = str(position.get("monitored_trader") or "").strip().lower()
-        incoming_trader = str(trader_wallet or "").strip().lower()
-        same_trader = bool(monitored_trader and incoming_trader and monitored_trader == incoming_trader)
 
         if shares_to_sell > held_shares:
             logger.info(
