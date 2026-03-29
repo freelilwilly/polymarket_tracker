@@ -48,12 +48,13 @@ class PolymarketAPIClient:
         "acx",
     }
     
-    def __init__(self):
+    def __init__(self, allow_order_execution: bool = True):
         """Initialize API client."""
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_order_error: Optional[dict[str, Any]] = None
         self.slug_converter = SlugConverter()
         self._market_info_cache: dict[str, dict[str, Any]] = {}
+        self.allow_order_execution = bool(allow_order_execution)
         
         # US Trading Platform endpoints
         self.us_api_base = Config.US_API_BASE_URL
@@ -994,6 +995,18 @@ class PolymarketAPIClient:
         """
         url = f"{self.us_api_base}/v1/orders"
         self.last_order_error = None
+
+        if not self.allow_order_execution:
+            self.last_order_error = {
+                "status": None,
+                "message": "ORDER_EXECUTION_DISABLED",
+                "market_slug": market_slug,
+                "side": side,
+            }
+            logger.warning(
+                f"Order execution disabled by client safety guard: {side} {market_slug}"
+            )
+            return None
 
         outcome_lower = str(outcome or "").strip().lower()
         if outcome_lower not in ("yes", "no"):

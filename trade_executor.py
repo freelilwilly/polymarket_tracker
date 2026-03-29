@@ -140,6 +140,13 @@ class TradeExecutor:
                     "reason": "PRICE_TOLERANCE",
                     "current_price": current_price,
                 }
+
+            # Determine if this is a NO-side trade and enforce policy in both
+            # live and simulated execution paths.
+            is_no_side = normalized_outcome.lower() == "no"
+            if is_no_side and not Config.ALLOW_BUY_SHORT:
+                logger.info(f"Skipping NO-side trade for {market_slug} (ALLOW_BUY_SHORT=false)")
+                return {"skipped": True, "reason": "NO_SIDE_DISABLED"}
             
             # In test mode, just return success without executing
             if self.test_mode:
@@ -154,13 +161,6 @@ class TradeExecutor:
                 }
             
             # Execute actual buy order (LIVE MODE)
-            # Determine if this is a NO-side trade
-            is_no_side = normalized_outcome.lower() == "no"
-            
-            if is_no_side and not Config.ALLOW_BUY_SHORT:
-                logger.info(f"Skipping NO-side trade for {market_slug} (ALLOW_BUY_SHORT=false)")
-                return {"skipped": True, "reason": "NO_SIDE_DISABLED"}
-            
             # Place order via US API
             order_price_preview = max(0.01, min(0.99, current_price))
             if order_price_preview > current_price:
