@@ -77,6 +77,11 @@ class LiveTradingBot:
             f"(until {expires_at.isoformat()})"
         )
 
+    def _clear_us_market_untradable(self, market_slug: str):
+        if market_slug in self._us_untradable_until:
+            self._us_untradable_until.pop(market_slug, None)
+            logger.info(f"Removed US-untradable cache for market: {market_slug}")
+
     async def _refresh_selected_traders(self):
         """Refresh monitored traders and warm up monitor state."""
         logger.info("Refreshing selected traders...")
@@ -363,12 +368,6 @@ class LiveTradingBot:
                 )
                 return
 
-        if self._is_us_market_temporarily_untradable(market_slug):
-            logger.info(
-                f"Skipping BUY for temporarily cached US-untradable market: {market_slug}"
-            )
-            return
-
         normalized_outcome = await self.api_client.normalize_outcome_to_yes_no(
             market_slug,
             outcome,
@@ -378,6 +377,21 @@ class LiveTradingBot:
         if not normalized_outcome:
             logger.warning(f"Cannot normalize outcome for buy: {market_slug} | {outcome}")
             return
+
+        if self._is_us_market_temporarily_untradable(market_slug):
+            # Revalidate cached-untradable markets to recover quickly from false negatives.
+            probe_price = await self.api_client.get_best_price(market_slug, "buy", normalized_outcome)
+            if probe_price and probe_price > 0:
+                self._clear_us_market_untradable(market_slug)
+                logger.info(
+                    f"US market cache revalidated as tradable: {market_slug} | {normalized_outcome} | "
+                    f"price=${probe_price:.4f}"
+                )
+            else:
+                logger.info(
+                    f"Skipping BUY for temporarily cached US-untradable market: {market_slug}"
+                )
+                return
 
         self.position_manager.reconcile_outcome_alias(
             market_slug=market_slug,
@@ -450,7 +464,16 @@ class LiveTradingBot:
         )
 
         if result and result.get("skipped") and result.get("reason") == "US_MARKET_UNAVAILABLE":
-            self._mark_us_market_untradable(market_slug)
+            # Only cache for definitive unavailable reasons.
+            reasons = result.get("market_unavailable_reasons") or []
+            definitive_reasons = {"MARKET_NOT_FOUND", "NOT_TRADABLE", "ASSET_NOT_FOUND"}
+            if any(r in definitive_reasons for r in reasons):
+                self._mark_us_market_untradable(market_slug)
+            else:
+                logger.info(
+                    f"US market unavailable was non-definitive; not caching: {market_slug} | "
+                    f"reasons={reasons}"
+                )
             return
         
         if result and result.get("success"):
