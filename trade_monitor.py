@@ -106,9 +106,9 @@ class TradeMonitor:
                     duplicates_filtered += 1
                     logger.debug(f"Duplicate trade filtered: {t_key}")
             
-            # Only log duplicate filtering when there are new trades to report
-            if duplicates_filtered > 0 and len(new_trades) > 0:
-                logger.info(
+            # Only log at debug level - suspicious patterns caught by main_live.py monitoring
+            if duplicates_filtered > 0:
+                logger.debug(
                     f"Filtered {duplicates_filtered} duplicate(s) from {self._wallet_label(wallet)}: "
                     f"{len(new_trades)} new trade(s) remain"
                 )
