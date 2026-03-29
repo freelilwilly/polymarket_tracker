@@ -885,6 +885,39 @@ class PositionManager:
                 logger.info(f"Migrated {migrated} position(s) from team names to yes/no outcomes")
             if duplicates_to_remove:
                 logger.info(f"Removed {len(duplicates_to_remove)} duplicate position(s)")
+        
+        # Phase 3: Check for over-cap positions after sync
+        if self.balance and self.balance > 0:
+            market_cap = self.balance * Config.MAX_POSITION_SIZE_PER_MARKET
+            over_cap_positions = []
+            
+            for key, pos in self.positions.items():
+                market_slug = pos.get("market_slug")
+                if market_slug:
+                    market_exposure = self.get_market_exposure(market_slug)
+                    if market_exposure > market_cap:
+                        over_cap_positions.append({
+                            "market_slug": market_slug,
+                            "exposure": market_exposure,
+                            "cap": market_cap,
+                            "excess": market_exposure - market_cap,
+                        })
+            
+            # Deduplicate by market_slug
+            seen_markets = set()
+            unique_over_cap = []
+            for pos_info in over_cap_positions:
+                if pos_info["market_slug"] not in seen_markets:
+                    seen_markets.add(pos_info["market_slug"])
+                    unique_over_cap.append(pos_info)
+            
+            if unique_over_cap:
+                for pos_info in unique_over_cap:
+                    logger.warning(
+                        f"Position exceeds market cap: {pos_info['market_slug']} | "
+                        f"Exposure=${pos_info['exposure']:.2f} | Cap=${pos_info['cap']:.2f} | "
+                        f"Over by ${pos_info['excess']:.2f} ({pos_info['excess']/pos_info['cap']*100:.1f}%)"
+                    )
     
     def get_all_positions(self) -> list[dict[str, Any]]:
         """

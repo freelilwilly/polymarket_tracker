@@ -87,11 +87,30 @@ class TradeMonitor:
             
             # Filter to only new trades
             new_trades: list[dict[str, Any]] = []
+            duplicates_filtered = 0
+            
             for trade in trades:
                 t_key = trade_key(trade)
                 if t_key not in self.seen_trades[wallet]:
                     new_trades.append(trade)
                     self.seen_trades[wallet].add(t_key)
+                    
+                    # Log first few trade keys for validation (only in debug mode)
+                    if len(new_trades) <= 5:
+                        logger.debug(
+                            f"New trade key: {t_key} | "
+                            f"market={trade.get('market_slug') or trade.get('asset', 'unknown')} | "
+                            f"outcome={trade.get('outcome', 'unknown')}"
+                        )
+                else:
+                    duplicates_filtered += 1
+                    logger.debug(f"Duplicate trade filtered: {t_key}")
+            
+            if duplicates_filtered > 0:
+                logger.info(
+                    f"Filtered {duplicates_filtered} duplicate(s) from {self._wallet_label(wallet)}: "
+                    f"{len(new_trades)} new trade(s) remain"
+                )
             
             return new_trades
             

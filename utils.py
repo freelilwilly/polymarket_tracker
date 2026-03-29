@@ -93,19 +93,27 @@ def calculate_multiplier(
 
 
 def trade_key(trade: dict[str, Any]) -> str:
-    """Generate unique key for a trade."""
+    """
+    Generate unique key for a trade using immutable fields only.
+    
+    Critical: Do NOT include size or price, as these can change during
+    fills/updates and cause the same blockchain transaction to appear
+    as multiple unique trades when returned by the API.
+    """
     trade_id = trade.get("id")
     if trade_id is not None:
-        return str(trade_id)
+        return f"id:{trade_id}"
     
+    # Use immutable fields only: txHash, timestamp, maker/wallet, asset, outcome, side
     tx_hash = trade.get("transactionHash") or ""
     timestamp = trade.get("timestamp") or ""
-    asset = trade.get("asset") or ""
+    maker = trade.get("maker") or trade.get("proxyWallet") or trade.get("wallet") or ""
+    asset = trade.get("asset") or trade.get("market_slug") or trade.get("marketSlug") or ""
     outcome = trade.get("outcome") or ""
     side = trade.get("side") or ""
-    size = trade.get("size") or ""
-    price = trade.get("price") or ""
-    return f"{tx_hash}:{timestamp}:{asset}:{outcome}:{side}:{size}:{price}"
+    
+    # Build composite key without volatile size/price fields
+    return f"{tx_hash}:{timestamp}:{maker}:{asset}:{outcome}:{side}"
 
 
 def normalize_slug_for_key(slug: Any) -> str:

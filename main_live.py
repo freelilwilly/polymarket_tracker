@@ -412,6 +412,26 @@ class LiveTradingBot:
             return
 
         logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)}")
+        
+        # Phase 3: Duplicate trade detection monitoring
+        # Track trades by (market_slug, outcome) to detect suspicious patterns
+        trades_by_market = {}
+        for trade in trades:
+            market_slug = trade.get("market_slug")
+            outcome = trade.get("outcome")
+            if market_slug and outcome:
+                key = f"{market_slug}|{outcome}"
+                trades_by_market.setdefault(key, []).append(trade)
+        
+        # Alert if >3 trades for same market+outcome (potential duplicate issue)
+        for market_key, market_trades in trades_by_market.items():
+            if len(market_trades) > 3:
+                logger.error(
+                    f"Possible duplicate trade processing detected: {market_key} | "
+                    f"Count={len(market_trades)} trades in single poll | "
+                    f"Trader={self._trader_label(wallet)}"
+                )
+        
         for trade in trades:
             await self._process_trade(trade, wallet)
 
@@ -674,7 +694,14 @@ class LiveTradingBot:
 
         can_open, reason = self.position_manager.can_open_position(market_slug, investment_amount)
         if not can_open:
-            logger.warning(f"Cannot open position: {reason}")
+            # Phase 2: Enhanced market cap logging
+            current_exposure = self.position_manager.get_market_exposure(market_slug)
+            market_cap = balance * Config.MAX_POSITION_SIZE_PER_MARKET
+            logger.warning(
+                f"Market cap protection blocked BUY: {market_slug} | {normalized_outcome} | "
+                f"Current=${current_exposure:.2f} | Proposed=${investment_amount:.2f} | "
+                f"Cap=${market_cap:.2f} | Reason: {reason}"
+            )
             return
 
         target_shares = investment_amount / current_buy_price
