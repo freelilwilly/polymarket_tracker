@@ -175,10 +175,6 @@ class TraderSelector:
                         "aborting selection to avoid unfiltered expansion"
                     )
                     return []
-                logger.info(
-                    f"Using {len(candidate_pool)} tag-filtered candidates within global top "
-                    f"{Config.CANDIDATE_LIMIT}"
-                )
             else:
                 # Get trader performance data from Analytics API
                 logger.info("Fetching trader performance data...")
@@ -230,11 +226,6 @@ class TraderSelector:
                 )
                 return []
 
-            if not required_tags:
-                logger.info(
-                    f"Using {len(candidate_pool)} analytics candidates for selector filters"
-                )
-            
             # Filter traders
             qualified_traders: list[dict[str, Any]] = []
             
