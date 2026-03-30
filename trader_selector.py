@@ -1,4 +1,5 @@
 """Trader selection logic."""
+import asyncio
 import logging
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -18,26 +19,54 @@ class TraderSelector:
         """Initialize trader selector."""
         self.api_client = api_client
 
-    async def _get_required_tag_wallets(self) -> set[str]:
-        """Get wallet set matching REQUIRED_TRADER_TAGS via analytics API."""
+    async def _get_required_tag_candidates(self, max_rank: int) -> list[dict[str, Any]]:
+        """Get tagged analytics candidates constrained to global rank threshold."""
         required_tags = [
             t.strip() for t in (Config.REQUIRED_TRADER_TAGS or "").split(",") if t.strip()
         ]
         if not required_tags:
-            return set()
+            return []
 
-        # Fetch a broad tagged snapshot; bot only needs membership for top candidates.
-        tagged_rows = await self.api_client.get_traders_performance(
-            limit=max(1000, Config.CANDIDATE_LIMIT * 2),
-            apply_required_tags=True,
-        )
-        wallets = {
-            str(row.get("wallet") or "").strip().lower()
-            for row in tagged_rows
-            if row.get("wallet")
-        }
-        logger.info(f"Loaded {len(wallets)} wallets matching required tags")
-        return wallets
+        rank_cap = max(1, int(max_rank))
+        fetch_limit = max(1000, rank_cap * 4)
+
+        # Fetch a broad tagged snapshot and keep only global top-N by rank.
+        # Retry because analytics can intermittently return empty data for valid tag queries.
+        retry_delays = [0.0, 0.5, 1.0]
+        for attempt, delay_seconds in enumerate(retry_delays, start=1):
+            if delay_seconds > 0:
+                await asyncio.sleep(delay_seconds)
+
+            tagged_rows = await self.api_client.get_traders_performance(
+                limit=fetch_limit,
+                apply_required_tags=True,
+            )
+
+            candidates: list[dict[str, Any]] = []
+            for row in tagged_rows:
+                if not isinstance(row, dict):
+                    continue
+                wallet = str(row.get("wallet") or row.get("address") or "").strip().lower()
+                if not wallet:
+                    continue
+
+                rank = int(to_float(row.get("rank"), default=0.0))
+                if rank > 0 and rank <= rank_cap:
+                    candidates.append(row)
+
+            if candidates:
+                logger.info(
+                    f"Loaded {len(candidates)} tagged candidates within global top {rank_cap} "
+                    f"(attempt {attempt}/{len(retry_delays)})"
+                )
+                return candidates
+
+            logger.warning(
+                f"Tagged global-top candidate lookup returned 0 rows on attempt "
+                f"{attempt}/{len(retry_delays)}"
+            )
+
+        return []
 
     @staticmethod
     def _safe_trade_timestamp(raw_ts: Any) -> datetime:
@@ -127,31 +156,84 @@ class TraderSelector:
             List of trader dicts with wallet, display_name, win_rate, avg_trades_per_day, overall_profit
         """
         try:
-            # Get trader performance data from Analytics API
-            logger.info("Fetching trader performance data...")
-            traders_data = await self.api_client.get_traders_performance(
-                limit=Config.CANDIDATE_LIMIT,
-                apply_required_tags=False,
-            )
-            
-            if not traders_data:
-                logger.warning("No trader data received from Analytics API, using Data API fallback")
-                fallback = await self._select_top_traders_from_global_trades()
-                logger.info(f"Fallback selected {len(fallback)} traders")
-                return fallback
-            
-            ranked_candidates = sorted(
-                traders_data,
-                key=lambda trader: float(trader.get("overall_gain") or 0.0),
-                reverse=True,
-            )
-            candidate_pool = ranked_candidates[: Config.CANDIDATE_LIMIT]
-            logger.info(
-                f"Received {len(traders_data)} analytics traders; "
-                f"using global top {len(candidate_pool)} as candidate pool"
-            )
+            required_tags = [
+                t.strip() for t in (Config.REQUIRED_TRADER_TAGS or "").split(",") if t.strip()
+            ]
 
-            required_wallets = await self._get_required_tag_wallets()
+            candidate_pool: list[dict[str, Any]] = []
+
+            if required_tags:
+                # Intended behavior: global top-N first, then tag filter.
+                # Analytics exposes global rank per trader; use rank<=N within tagged feed
+                # to reconstruct that set robustly even when page ordering is inconsistent.
+                candidate_pool = await self._get_required_tag_candidates(
+                    max_rank=Config.CANDIDATE_LIMIT
+                )
+                if not candidate_pool:
+                    logger.error(
+                        "Required tag filter active but no tagged global-top candidates were found; "
+                        "aborting selection to avoid unfiltered expansion"
+                    )
+                    return []
+                logger.info(
+                    f"Using {len(candidate_pool)} tag-filtered candidates within global top "
+                    f"{Config.CANDIDATE_LIMIT}"
+                )
+            else:
+                # Get trader performance data from Analytics API
+                logger.info("Fetching trader performance data...")
+                traders_data = await self.api_client.get_traders_performance(
+                    limit=max(1000, Config.CANDIDATE_LIMIT * 4),
+                    apply_required_tags=False,
+                )
+
+                if traders_data:
+                    ranked_by_rank = [
+                        trader
+                        for trader in traders_data
+                        if 0 < int(to_float(trader.get("rank"), default=0.0)) <= Config.CANDIDATE_LIMIT
+                    ]
+                    if ranked_by_rank:
+                        ranked_by_rank.sort(
+                            key=lambda trader: int(to_float(trader.get("rank"), default=10_000_000))
+                        )
+                        candidate_pool = ranked_by_rank
+                    else:
+                        ranked_candidates = sorted(
+                            traders_data,
+                            key=lambda trader: float(trader.get("overall_gain") or 0.0),
+                            reverse=True,
+                        )
+                        candidate_pool = ranked_candidates[: Config.CANDIDATE_LIMIT]
+
+                if not candidate_pool:
+                    traders_data = []
+
+            if not candidate_pool:
+                if Config.ENABLE_TRADER_SELECTION_FALLBACK:
+                    logger.warning("No trader data received from Analytics API, using Data API fallback")
+                    fallback = await self._select_top_traders_from_global_trades()
+
+                    # If required tags are configured, never allow untagged fallback selection.
+                    if required_tags:
+                        logger.error(
+                            "Required tag filter active and analytics candidates unavailable; "
+                            "refusing fallback selection (fail-closed)"
+                        )
+                        return []
+
+                    logger.info(f"Fallback selected {len(fallback)} traders")
+                    return fallback
+
+                logger.error(
+                    "No trader data received from Analytics API; fallback disabled for safety"
+                )
+                return []
+
+            if not required_tags:
+                logger.info(
+                    f"Using {len(candidate_pool)} analytics candidates for selector filters"
+                )
             
             # Filter traders
             qualified_traders: list[dict[str, Any]] = []
@@ -159,10 +241,6 @@ class TraderSelector:
             for trader in candidate_pool:
                 wallet = trader.get("wallet") or trader.get("address")
                 if not wallet:
-                    continue
-                wallet_norm = str(wallet).strip().lower()
-
-                if required_wallets and wallet_norm not in required_wallets:
                     continue
                 
                 # Extract performance metrics

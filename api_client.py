@@ -608,6 +608,7 @@ class PolymarketAPIClient:
                     "display_name": trader.get("display_name") or trader.get("trader_name") or trader.get("name"),
                     "win_rate": to_float(trader.get("win_rate"), default=0.0),
                     "overall_gain": to_float(trader.get("overall_gain"), default=0.0),
+                    "rank": int(to_float(trader.get("rank"), default=0.0)) or None,
                     "tags": trader.get("tags") or [],
                     "tag": trader.get("tag"),
                 })

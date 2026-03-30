@@ -453,12 +453,20 @@ class TestTradingBot:
     async def _refresh_selected_traders(self):
         """Refresh monitored traders and warm up monitor state."""
         logger.info("Refreshing selected traders...")
-        self.selected_traders = await self.trader_selector.select_top_traders()
+        refreshed_traders = await self.trader_selector.select_top_traders()
         self._last_trader_refresh = datetime.now(timezone.utc)
         
-        if not self.selected_traders:
-            logger.warning("No traders selected during refresh")
+        if not refreshed_traders:
+            if self.selected_traders:
+                logger.warning(
+                    f"Trader refresh returned 0 traders; retaining previous selection "
+                    f"({len(self.selected_traders)} traders)"
+                )
+            else:
+                logger.warning("No traders selected during refresh")
             return
+
+        self.selected_traders = refreshed_traders
 
         selected_at_epoch = datetime.now(timezone.utc).timestamp()
         for index, trader in enumerate(self.selected_traders, start=1):
