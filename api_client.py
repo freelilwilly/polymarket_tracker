@@ -12,6 +12,7 @@ import asyncio
 import base64
 import json
 import logging
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlsplit
@@ -350,6 +351,25 @@ class PolymarketAPIClient:
                 if attempt < max_retries - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
+                return None
+            except (
+                aiohttp.ClientConnectionError,
+                aiohttp.ClientOSError,
+                aiohttp.ServerDisconnectedError,
+                ConnectionResetError,
+                OSError,
+            ) as e:
+                if attempt < max_retries - 1:
+                    base_wait = 2 ** attempt
+                    wait_time = base_wait + random.uniform(0.0, 0.25)
+                    logger.warning(
+                        f"Transient connection error (attempt {attempt + 1}/{max_retries}): {e}. "
+                        f"Retrying in {wait_time:.2f}s..."
+                    )
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                logger.exception(f"Request error: {e}")
                 return None
             except Exception as e:
                 logger.exception(f"Request error: {e}")

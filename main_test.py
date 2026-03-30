@@ -153,8 +153,13 @@ class TestTradingBot:
 
     def _cache_non_sports_market(self, market_slug: str) -> None:
         normalized_slug = self._normalize_market_slug(market_slug)
+        now = datetime.now(timezone.utc)
+        existing_expires = self._non_sports_untradable_until.get(normalized_slug)
+        if isinstance(existing_expires, datetime) and now < existing_expires:
+            return
+
         ttl_seconds = max(1, int(Config.NON_SPORTS_SKIP_CACHE_SECONDS))
-        expires_at = datetime.now(timezone.utc).replace(microsecond=0)
+        expires_at = now.replace(microsecond=0)
         expires_at = expires_at + timedelta(seconds=ttl_seconds)
         self._non_sports_untradable_until[normalized_slug] = expires_at
         logger.info(f"Caching non-sports skip: {market_slug} | ttl={ttl_seconds}s")
