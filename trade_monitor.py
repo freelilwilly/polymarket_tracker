@@ -154,9 +154,10 @@ class TradeMonitor:
             if not trades:
                 return []
             
-            # Filter to only new trades
+            # Filter to only new actionable trades
             new_trades: list[dict[str, Any]] = []
             duplicates_filtered = 0
+            non_actionable_filtered = 0
             
             # Track trades without txHash for monitoring
             missing_txhash_count = 0
@@ -173,7 +174,7 @@ class TradeMonitor:
                     or trade.get("slug")
                     or trade.get("eventSlug")
                 )
-                if trade_market and trade_side and trade_ts is not None:
+                if trade_market and trade_side in ("BUY", "SELL") and trade_ts is not None:
                     checkpoint_key = f"{str(trade_market).strip().lower()}|{trade_side}"
                     latest = latest_timestamp_by_market_side.get(checkpoint_key)
                     if latest is None or trade_ts > latest:
@@ -184,8 +185,19 @@ class TradeMonitor:
                     missing_txhash_count += 1
                 
                 if t_key not in self.seen_trades[wallet]:
-                    new_trades.append(trade)
                     self.seen_trades[wallet].add(t_key)
+
+                    if trade_side not in ("BUY", "SELL"):
+                        non_actionable_filtered += 1
+                        logger.debug(
+                            f"Filtered non-actionable activity: {self._wallet_label(wallet)} | "
+                            f"type={trade.get('type') or 'UNKNOWN'} | "
+                            f"side={trade.get('side') or 'UNKNOWN'} | "
+                            f"tx={trade.get('transactionHash') or 'NO_TX'}"
+                        )
+                        continue
+
+                    new_trades.append(trade)
                     
                     # Log first few trade keys for validation (only in debug mode)
                     if len(new_trades) <= 5:
@@ -206,6 +218,12 @@ class TradeMonitor:
                 logger.debug(
                     f"Filtered {duplicates_filtered} duplicate(s) from {self._wallet_label(wallet)}: "
                     f"{len(new_trades)} new trade(s) remain"
+                )
+
+            if non_actionable_filtered > 0:
+                logger.debug(
+                    f"Filtered {non_actionable_filtered} non-actionable event(s) from "
+                    f"{self._wallet_label(wallet)}"
                 )
 
             total_seen = len(trades)
