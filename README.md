@@ -181,7 +181,11 @@ The bot periodically syncs local positions with API positions to detect:
 
 ### State Persistence
 
-All positions are persisted to `positions_state.json`:
+Positions are persisted with separate files per mode:
+- Live mode: `positions_state.json`
+- Test mode: `test_positions_state.json`
+
+Both files:
 - Survives bot restarts
 - Tracks entry prices, invested amounts
 - Includes monitored trader info
@@ -247,7 +251,8 @@ main_test.py               # Test mode entry point
 
 These files are generated at runtime and should NOT be committed:
 
-- `positions_state.json` - Position tracking state
+- `positions_state.json` - Live mode position tracking state
+- `test_positions_state.json` - Test mode position tracking state
 - `learned_slug_mappings.json` - Learned market slug mappings
 - `*.xlsx` - Excel performance workbooks
 - `copytrade.log` - Application logs

@@ -24,16 +24,18 @@ logger = logging.getLogger(__name__)
 class PositionManager:
     """Manages position tracking and sizing."""
     
-    def __init__(self, api_client: PolymarketAPIClient):
+    def __init__(self, api_client: PolymarketAPIClient, state_file: Optional[str] = None):
         """
         Initialize position manager.
         
         Args:
             api_client: API client instance
+            state_file: Path for persisted position state file
         """
         self.api_client = api_client
         self.positions: dict[str, dict[str, Any]] = {}
-        self.state_file = "positions_state.json"
+        configured_state_file = str(state_file or "").strip()
+        self.state_file = configured_state_file or "positions_state.json"
         self.balance: Optional[float] = None
         self.buying_power: Optional[float] = None
         self._recent_owner_cache: dict[str, dict[str, Any]] = {}
@@ -49,6 +51,48 @@ class PositionManager:
         if callable(normalizer):
             return str(normalizer(slug) or "").strip().lower()
         return slug[4:] if slug.startswith("aec-") else slug
+
+    @staticmethod
+    def _normalize_trader_shares(raw: Any) -> dict[str, float]:
+        if not isinstance(raw, dict):
+            return {}
+
+        normalized: dict[str, float] = {}
+        for trader, shares in raw.items():
+            owner = str(trader or "").strip().lower()
+            if not owner:
+                continue
+            amount = max(0.0, to_float(shares, default=0.0))
+            if amount <= 0:
+                continue
+            normalized[owner] = normalized.get(owner, 0.0) + amount
+
+        return normalized
+
+    @staticmethod
+    def _merge_trader_shares(base: dict[str, float], extra: dict[str, float]) -> dict[str, float]:
+        merged = dict(base)
+        for owner, shares in extra.items():
+            merged[owner] = merged.get(owner, 0.0) + max(0.0, to_float(shares, default=0.0))
+        return {owner: amount for owner, amount in merged.items() if amount > 0}
+
+    def _ensure_position_trader_shares(self, position: dict[str, Any]) -> dict[str, float]:
+        trader_shares = self._normalize_trader_shares(position.get("trader_shares"))
+        total_shares = max(0.0, to_float(position.get("shares"), default=0.0))
+        owner = str(position.get("monitored_trader") or "").strip().lower()
+
+        if not trader_shares and owner and total_shares > 0:
+            trader_shares = {owner: total_shares}
+
+        position["trader_shares"] = trader_shares
+        return trader_shares
+
+    @staticmethod
+    def _pick_primary_owner(trader_shares: dict[str, float]) -> Optional[str]:
+        positive = [(owner, shares) for owner, shares in trader_shares.items() if shares > 0]
+        if len(positive) == 1:
+            return positive[0][0]
+        return None
 
     def remember_recent_owner(
         self,
@@ -94,11 +138,23 @@ class PositionManager:
         if not position or not owner:
             return False
 
+        shares = max(0.0, to_float(position.get("shares"), default=0.0))
+        trader_shares = self._ensure_position_trader_shares(position)
+        trader_added = False
+        if owner not in trader_shares and shares > 0:
+            trader_shares[owner] = shares
+            trader_added = True
+
         existing_owner = str(position.get("monitored_trader") or "").strip().lower()
         if existing_owner == owner:
+            if trader_added:
+                position["trader_shares"] = trader_shares
+                self.positions[key] = position
+                self._save_state()
             return False
 
         position["monitored_trader"] = owner
+        position["trader_shares"] = trader_shares
         self.positions[key] = position
         self._save_state()
         logger.info(
@@ -207,6 +263,15 @@ class PositionManager:
                                 if not existing_owner and incoming_owner:
                                     existing["monitored_trader"] = incoming_owner
 
+                                existing_trader_shares = self._normalize_trader_shares(existing.get("trader_shares"))
+                                incoming_trader_shares = self._normalize_trader_shares(normalized_pos.get("trader_shares"))
+                                if not incoming_trader_shares and incoming_owner and incoming_shares > 0:
+                                    incoming_trader_shares = {incoming_owner.lower(): incoming_shares}
+                                existing["trader_shares"] = self._merge_trader_shares(
+                                    existing_trader_shares,
+                                    incoming_trader_shares,
+                                )
+
                                 canonical_positions[canonical_key] = existing
                                 migrated += 1
                             else:
@@ -222,6 +287,9 @@ class PositionManager:
                             continue
                         owner = str(pos.get("monitored_trader") or "").strip().lower()
                         pos["monitored_trader"] = owner or None
+                        trader_shares = self._ensure_position_trader_shares(pos)
+                        primary_owner = self._pick_primary_owner(trader_shares)
+                        pos["monitored_trader"] = primary_owner or (owner or None)
 
                     self.balance = data.get("balance")
                     self.buying_power = data.get("buying_power")
@@ -388,6 +456,13 @@ class PositionManager:
         if not canonical_pos.get("monitored_trader") and alias_pos.get("monitored_trader"):
             canonical_pos["monitored_trader"] = alias_pos.get("monitored_trader")
 
+        canonical_trader_shares = self._ensure_position_trader_shares(canonical_pos)
+        alias_trader_shares = self._ensure_position_trader_shares(alias_pos)
+        merged_trader_shares = self._merge_trader_shares(canonical_trader_shares, alias_trader_shares)
+        canonical_pos["trader_shares"] = merged_trader_shares
+        primary_owner = self._pick_primary_owner(merged_trader_shares)
+        canonical_pos["monitored_trader"] = primary_owner or canonical_pos.get("monitored_trader")
+
         self.positions.pop(alias_key, None)
         self.positions[canonical_key] = canonical_pos
         self._save_state()
@@ -516,8 +591,15 @@ class PositionManager:
             existing["outcome"] = outcome.lower()
 
             # Keep first opened timestamp; refresh copied-trader source if provided.
+            trader_shares = self._ensure_position_trader_shares(existing)
             if owner:
                 existing["monitored_trader"] = owner
+                trader_shares[owner] = trader_shares.get(owner, 0.0) + shares
+
+            existing["trader_shares"] = trader_shares
+            primary_owner = self._pick_primary_owner(trader_shares)
+            if primary_owner:
+                existing["monitored_trader"] = primary_owner
 
             self.positions[key] = existing
             self._save_state()
@@ -537,6 +619,7 @@ class PositionManager:
             "invested": new_invested,
             "opened_at": datetime.now(timezone.utc).isoformat(),
             "monitored_trader": owner or None,
+            "trader_shares": {owner: shares} if owner and shares > 0 else {},
         }
 
         self.positions[key] = position
@@ -607,6 +690,7 @@ class PositionManager:
         outcome: str,
         new_shares: float,
         new_invested: Optional[float] = None,
+        trader_wallet: Optional[str] = None,
     ):
         """
         Update position share count (for partial closes).
@@ -616,6 +700,7 @@ class PositionManager:
             outcome: Outcome
             new_shares: New share count
             new_invested: New invested amount (optional, will be calculated if not provided)
+            trader_wallet: Trader attribution to reduce first (optional)
         """
         key = self.get_position_key(market_slug, outcome)
         
@@ -625,24 +710,68 @@ class PositionManager:
         
         position = self.positions[key]
         old_shares = position["shares"]
+        old_shares_value = max(0.0, to_float(old_shares, default=0.0))
+        target_shares = max(0.0, to_float(new_shares, default=0.0))
+        reduction = max(0.0, old_shares_value - target_shares)
         
         # Update shares
-        position["shares"] = new_shares
+        position["shares"] = target_shares
         
         # Update invested amount
         if new_invested is not None:
             position["invested"] = new_invested
         else:
             # Proportional reduction
-            if old_shares > 0:
-                position["invested"] = position["invested"] * (new_shares / old_shares)
+            if old_shares_value > 0:
+                position["invested"] = position["invested"] * (target_shares / old_shares_value)
+
+        trader_shares = self._ensure_position_trader_shares(position)
+        owner = str(trader_wallet or "").strip().lower()
+        if reduction > 0 and owner and owner in trader_shares:
+            trader_shares[owner] = max(0.0, trader_shares.get(owner, 0.0) - reduction)
+
+        total_attributed = sum(max(0.0, v) for v in trader_shares.values())
+        if total_attributed > 0 and target_shares >= 0:
+            if total_attributed > target_shares + 1e-9:
+                scale = target_shares / total_attributed if total_attributed > 0 else 0.0
+                for k in list(trader_shares.keys()):
+                    trader_shares[k] = max(0.0, trader_shares[k] * scale)
+            elif not owner:
+                # API-led share updates without a specific trader should preserve ratios.
+                scale = target_shares / total_attributed if total_attributed > 0 else 0.0
+                for k in list(trader_shares.keys()):
+                    trader_shares[k] = max(0.0, trader_shares[k] * scale)
+
+        trader_shares = {k: v for k, v in trader_shares.items() if v > 1e-9}
+        position["trader_shares"] = trader_shares
+        primary_owner = self._pick_primary_owner(trader_shares)
+        position["monitored_trader"] = primary_owner
+
+        attributed_after = sum(max(0.0, v) for v in trader_shares.values())
+        if attributed_after > target_shares + 1e-6:
+            logger.warning(
+                f"Attribution invariant warning: {market_slug} | {outcome} | "
+                f"attributed={attributed_after:.6f} exceeds shares={target_shares:.6f}"
+            )
         
         self._save_state()
         
         logger.info(
             f"Updated position: {market_slug} | {outcome} | "
-            f"{old_shares:.2f} -> {new_shares:.2f} shares"
+            f"{old_shares_value:.2f} -> {target_shares:.2f} shares"
         )
+
+    def get_trader_attributed_shares(self, market_slug: str, outcome: str, trader_wallet: str) -> float:
+        position = self.get_position(market_slug, outcome)
+        if not position:
+            return 0.0
+
+        owner = str(trader_wallet or "").strip().lower()
+        if not owner:
+            return 0.0
+
+        trader_shares = self._ensure_position_trader_shares(position)
+        return max(0.0, to_float(trader_shares.get(owner), default=0.0))
     
     async def sync_positions_with_api(self):
         """
@@ -937,6 +1066,7 @@ class PositionManager:
                 "invested": invested,
                 "opened_at": datetime.now(timezone.utc).isoformat(),
                 "monitored_trader": recovered_owner,
+                "trader_shares": {recovered_owner: shares} if recovered_owner else {},
             }
             imported += 1
             logger.debug(f"Imported new API position: {key}")

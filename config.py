@@ -86,9 +86,11 @@ class Config:
 
     # Test Mode Configuration
     TEST_EXCEL_WORKBOOK: str = os.getenv("TEST_EXCEL_WORKBOOK", "test_performance.xlsx")
+    TEST_POSITION_STATE_FILE: str = os.getenv("TEST_POSITION_STATE_FILE", "test_positions_state.json")
     
     # Live Mode Configuration
     LIVE_EXCEL_WORKBOOK: str = os.getenv("LIVE_EXCEL_WORKBOOK", "live_performance.xlsx")
+    LIVE_POSITION_STATE_FILE: str = os.getenv("LIVE_POSITION_STATE_FILE", "positions_state.json")
     
     # Google Sheets Configuration
     GOOGLE_SHEETS_ENABLED: bool = os.getenv("GOOGLE_SHEETS_ENABLED", "false").lower() in ("true", "1", "yes")

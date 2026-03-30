@@ -40,7 +40,10 @@ class LiveTradingBot:
     def __init__(self):
         """Initialize bot components."""
         self.api_client = PolymarketAPIClient()
-        self.position_manager = PositionManager(self.api_client)
+        self.position_manager = PositionManager(
+            self.api_client,
+            state_file=Config.LIVE_POSITION_STATE_FILE,
+        )
         self.slug_converter = SlugConverter()
         self.trader_selector = TraderSelector(self.api_client)
         self.trade_monitor = TradeMonitor(self.api_client, self.slug_converter)
@@ -1108,7 +1111,13 @@ class LiveTradingBot:
             )
             return
 
-        if not monitored_trader:
+        trader_local_shares = self.position_manager.get_trader_attributed_shares(
+            market_slug,
+            normalized_outcome,
+            incoming_trader,
+        )
+
+        if trader_local_shares <= 0 and not monitored_trader:
             recovered_owner = self.position_manager.get_recent_owner_candidate(
                 market_slug,
                 normalized_outcome,
@@ -1129,6 +1138,11 @@ class LiveTradingBot:
                     f"Recovered SELL owner link and allowing copied SELL: {market_slug} | "
                     f"{normalized_outcome} | trader={self._trader_label(incoming_trader)}"
                 )
+                trader_local_shares = self.position_manager.get_trader_attributed_shares(
+                    market_slug,
+                    normalized_outcome,
+                    incoming_trader,
+                )
             else:
                 logger.info(
                     f"Skipping SELL for unlinked/manual position: {market_slug} | {normalized_outcome} | "
@@ -1136,7 +1150,7 @@ class LiveTradingBot:
                 )
                 return
 
-        if monitored_trader != incoming_trader:
+        if trader_local_shares <= 0 and monitored_trader != incoming_trader:
             logger.info(
                 f"Skipping SELL from non-owning trader: {market_slug} | {normalized_outcome} | "
                 f"position owner={self._trader_label(monitored_trader)}, "
@@ -1144,7 +1158,17 @@ class LiveTradingBot:
             )
             return
 
-        shares_to_sell = held_shares
+        if trader_local_shares <= 0 and monitored_trader == incoming_trader:
+            trader_local_shares = held_shares
+
+        if trader_local_shares <= 0:
+            logger.info(
+                f"Skipping SELL from trader with no attributed local shares: {market_slug} | "
+                f"{normalized_outcome} | trader={self._trader_label(incoming_trader)}"
+            )
+            return
+
+        shares_to_sell = trader_local_shares
         copied_sell_shares = max(0.0, to_float(observed_size, default=0.0))
 
         if Config.SELL_PERCENT_SIZING_ENABLED:
@@ -1181,18 +1205,25 @@ class LiveTradingBot:
             sizing_reason = "positions_api_denominator"
 
             sell_ratio = max(0.0, min(1.0, sell_ratio))
-            shares_to_sell = held_shares * sell_ratio
+            shares_to_sell = trader_local_shares * sell_ratio
 
             logger.info(
                 f"SELL percent sizing: {market_slug} | {normalized_outcome} | "
                 f"copied_current={copied_current_shares:.2f}, copied_sell={copied_sell_shares:.2f}, "
-                f"ratio={sell_ratio:.4f}, local_held={held_shares:.2f}, local_sell={shares_to_sell:.2f}, "
+                f"ratio={sell_ratio:.4f}, local_trader_held={trader_local_shares:.2f}, local_sell={shares_to_sell:.2f}, "
                 f"mode={sizing_reason}"
             )
 
+        if shares_to_sell > trader_local_shares:
+            logger.info(
+                f"Oversell signal capped to trader-attributed size: requested={shares_to_sell:.2f}, "
+                f"attributed={trader_local_shares:.2f}"
+            )
+            shares_to_sell = trader_local_shares
+
         if shares_to_sell > held_shares:
             logger.info(
-                f"Oversell signal capped to held size: requested={shares_to_sell:.2f}, held={held_shares:.2f}"
+                f"Oversell signal capped to total held size: requested={shares_to_sell:.2f}, held={held_shares:.2f}"
             )
             shares_to_sell = held_shares
 
@@ -1235,6 +1266,31 @@ class LiveTradingBot:
                 f"Copied SELL executed (market-style IOC): {market_slug} | {normalized_outcome} | "
                 f"{sold_shares:.2f} shares @ ${exit_price:.4f}"
             )
+
+            if sold_shares >= held_shares - 1e-9:
+                closed_position = self.position_manager.close_position(
+                    market_slug=market_slug,
+                    outcome=normalized_outcome,
+                    exit_price=exit_price if exit_price > 0 else 0.0,
+                    reason="trader_signal",
+                )
+
+                if closed_position:
+                    pnl = to_float(closed_position.get("pnl"), default=0.0)
+                    pnl_pct = to_float(closed_position.get("pnl_pct"), default=0.0)
+                    logger.info(f"P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
+            else:
+                remaining_shares = max(0.0, held_shares - sold_shares)
+                self.position_manager.update_position_shares(
+                    market_slug=market_slug,
+                    outcome=normalized_outcome,
+                    new_shares=remaining_shares,
+                    trader_wallet=incoming_trader,
+                )
+                logger.info(
+                    f"Partial SELL applied: {market_slug} | {normalized_outcome} | "
+                    f"sold={sold_shares:.2f}, remaining={remaining_shares:.2f}"
+                )
 
             # Log to Excel
             self.excel_tracker.log_trade(

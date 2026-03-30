@@ -147,6 +147,21 @@ class TradeExecutor:
             if is_no_side and not Config.ALLOW_BUY_SHORT:
                 logger.info(f"Skipping NO-side trade for {market_slug} (ALLOW_BUY_SHORT=false)")
                 return {"skipped": True, "reason": "NO_SIDE_DISABLED"}
+
+            # Mirror US API buy quantity semantics in both live and test modes.
+            # Live order placement rounds BUY shares to nearest integer and rejects
+            # non-positive quantities; enforce the same gate before simulation.
+            buy_quantity = int(round(max(0.0, float(target_shares))))
+            if buy_quantity <= 0:
+                logger.info(
+                    f"Skipping BUY: quantity rounds to zero under live order rules: "
+                    f"{market_slug} | target_shares={target_shares:.6f}"
+                )
+                return {
+                    "skipped": True,
+                    "reason": "ORDER_QUANTITY_TOO_SMALL",
+                    "current_price": current_price,
+                }
             
             # In test mode, just return success without executing
             if self.test_mode:
@@ -379,6 +394,22 @@ class TradeExecutor:
             # Copied SELLs are market-only: force aggressive IOC limits and ignore
             # caller-provided limit prices so orders cannot rest on the book.
             price = 0.01 if normalized_outcome.lower() == "yes" else 0.99
+
+            # Mirror US API sell quantity semantics in both live and test modes.
+            # Live order placement floors SELL shares to integer quantity and rejects
+            # non-positive quantities; enforce the same gate before simulation.
+            sell_quantity = int(max(0.0, float(shares)))
+            if sell_quantity <= 0:
+                logger.info(
+                    f"Skipping SELL: quantity floors to zero under live order rules: "
+                    f"{market_slug} | shares={shares:.6f}"
+                )
+                return {
+                    "skipped": True,
+                    "reason": "ORDER_QUANTITY_TOO_SMALL",
+                    "shares": 0.0,
+                    "price": price,
+                }
             
             # In test mode, just return success
             if self.test_mode:
