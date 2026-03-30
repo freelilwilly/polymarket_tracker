@@ -688,7 +688,11 @@ class PositionManager:
             # Try to normalize outcome (team name → yes/no)
             normalized_outcome = None
             if outcome_lower not in ("yes", "no"):
-                normalized_outcome = await self.api_client.normalize_outcome_to_yes_no(market_slug, raw_outcome)
+                normalized_outcome = await self.api_client.normalize_outcome_to_yes_no(
+                    market_slug,
+                    raw_outcome,
+                    caller_context="position_sync",
+                )
             
             # Use normalized outcome if available, otherwise use raw lowercase
             primary_outcome = normalized_outcome if normalized_outcome else outcome_lower
@@ -772,12 +776,23 @@ class PositionManager:
                     matched_api_positions.add(matched_key)
             
             if not found_in_api:
+                miss_threshold = max(1, Config.POSITION_SYNC_MISS_THRESHOLD)
+                local_outcome_lower = str(local_outcome or "").strip().lower()
+
+                # For non-binary local outcomes (team labels) while Gamma metadata is
+                # unavailable, use a wider miss threshold to avoid close/re-import churn
+                # from transient API omission or unresolved normalization.
+                if local_outcome_lower not in ("yes", "no"):
+                    metadata_available = await self.api_client.get_market_info(local_market)
+                    if not metadata_available:
+                        miss_threshold = max(miss_threshold, 12)
+
                 misses = int(self._sync_missing_counts.get(miss_identity, 0)) + 1
                 self._sync_missing_counts[miss_identity] = misses
-                if misses < max(1, Config.POSITION_SYNC_MISS_THRESHOLD):
+                if misses < miss_threshold:
                     logger.warning(
-                        f"Deferring external close until miss threshold: {local_market} | {local_outcome} | "
-                        f"misses={misses}/{max(1, Config.POSITION_SYNC_MISS_THRESHOLD)}"
+                        f"Deferring external close after fallback match miss: {local_market} | {local_outcome} | "
+                        f"misses={misses}/{miss_threshold}"
                     )
                     continue
 
@@ -788,7 +803,7 @@ class PositionManager:
                     to_float(local_pos.get("shares"), default=0.0),
                 )
                 logger.warning(
-                    f"Position closed externally after miss threshold: {local_market} | {local_outcome} | "
+                    f"Position closed externally after repeated fallback match misses: {local_market} | {local_outcome} | "
                     f"misses={misses}"
                 )
                 to_remove.append(key)

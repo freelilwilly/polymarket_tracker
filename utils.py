@@ -297,6 +297,7 @@ async def normalize_outcome_to_yes_no(
     logger,
     strict: bool = False,
     allow_fuzzy: Optional[bool] = None,
+    caller_context: Optional[str] = None,
 ) -> Optional[str]:
     """
     Normalize arbitrary outcome text to 'yes' or 'no' for binary markets.
@@ -305,13 +306,20 @@ async def normalize_outcome_to_yes_no(
         'yes' or 'no' if outcome is unambiguously resolved, None otherwise
     """
     try:
+        context_suffix = f" | caller={caller_context}" if caller_context else ""
         market_info = await api_client.get_market_info(slug)
         if not market_info:
-            logger.info(
+            message = (
                 f"Market metadata unavailable for {slug}. "
                 f"This market may not be indexed in Gamma API yet or may use a different identifier format. "
-                f"Proceeding with caller fallback behavior."
+                f"Proceeding with caller fallback behavior{context_suffix}."
             )
+            # Position sync emits dedicated warning lines only when fallback matching
+            # fails, so keep metadata-miss lines at debug to avoid log spam.
+            if caller_context == "position_sync":
+                logger.debug(message)
+            else:
+                logger.info(message)
             return None
 
         tokens = market_info.get("tokens") or []
@@ -328,12 +336,12 @@ async def normalize_outcome_to_yes_no(
             allow_fuzzy=fuzzy_enabled,
         )
         if resolved_index is None:
-            logger.error(f"Could not resolve outcome '{outcome}' for {slug}")
-            logger.error(f"Available outcomes: {[t.get('outcome') for t in tokens]}")
+            logger.error(f"Could not resolve outcome '{outcome}' for {slug}{context_suffix}")
+            logger.error(f"Available outcomes: {[t.get('outcome') for t in tokens]}{context_suffix}")
             return None
 
         return "yes" if resolved_index == 0 else "no"
 
     except Exception as e:
-        logger.error(f"Error normalizing outcome for {slug}: {e}")
+        logger.error(f"Error normalizing outcome for {slug}{context_suffix}: {e}")
         return None

@@ -67,9 +67,13 @@ class SlugConverter:
     def _normalize(slug: str) -> str:
         """Normalize slug for consistent comparison."""
         normalized = str(slug or "").strip().lower()
-        if normalized.startswith("aec-"):
-            normalized = normalized[4:]
-        return normalized
+        if not normalized:
+            return ""
+
+        parts = [p for p in normalized.split("-") if p]
+        while len(parts) > 1 and parts[0] in {"aec", "asc", "asm", "acm", "acx"}:
+            parts = parts[1:]
+        return "-".join(parts)
     
     def _save_mappings(self) -> None:
         """Persist learned mappings to file."""

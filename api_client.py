@@ -39,6 +39,8 @@ class PolymarketAPIClient:
         "sfo": "sf",
         "tam": "tb",
     }
+    # Reverse map for abbreviation lookup (e.g., "pho" -> "phx")
+    TEAM_ABBREVIATION_REVERSE_MAP: dict[str, str] = {v: k for k, v in TEAM_ABBREVIATION_MAP.items()}
 
     STRIPPABLE_SLUG_PREFIXES: set[str] = {
         "aec",
@@ -118,6 +120,15 @@ class PolymarketAPIClient:
         transformed = [self.TEAM_ABBREVIATION_MAP.get(seg, seg) for seg in segments]
         return "-".join(transformed)
 
+    def _apply_team_abbreviation_reverse_map(self, slug: str) -> str:
+        base = self._normalize_slug_value(slug)
+        if not base:
+            return ""
+
+        segments = base.split("-")
+        transformed = [self.TEAM_ABBREVIATION_REVERSE_MAP.get(seg, seg) for seg in segments]
+        return "-".join(transformed)
+
     def _generate_slug_candidates(self, market_slug: str) -> list[str]:
         """Generate deterministic slug candidates for metadata and US order endpoints."""
         base = self._normalize_slug_value(market_slug)
@@ -151,14 +162,24 @@ class PolymarketAPIClient:
             _add(mapped)
             _add(self._with_aec_prefix(mapped))
 
+        # Reverse abbreviation mapping fallback.
+        reverse_mapped = self._apply_team_abbreviation_reverse_map(base)
+        if reverse_mapped and reverse_mapped != base:
+            _add(reverse_mapped)
+            _add(self._with_aec_prefix(reverse_mapped))
+
         # If learned mapping also has additional abbreviations, include it too.
         if learned:
             mapped_learned = self._apply_team_abbreviation_map(learned)
             if mapped_learned:
                 _add(mapped_learned)
                 _add(self._with_aec_prefix(mapped_learned))
+            reverse_mapped_learned = self._apply_team_abbreviation_reverse_map(learned)
+            if reverse_mapped_learned:
+                _add(reverse_mapped_learned)
+                _add(self._with_aec_prefix(reverse_mapped_learned))
 
-        return ordered[:8]
+        return ordered[:12]
 
     @staticmethod
     def _extract_error_message(raw_text: str) -> str:
@@ -615,9 +636,18 @@ class PolymarketAPIClient:
         if cache_entry:
             expires_at = cache_entry.get("expires_at")
             if isinstance(expires_at, datetime) and now < expires_at:
-                return cache_entry.get("data")
+                cached_data = cache_entry.get("data")
+                logger.debug(
+                    f"Market info cache hit: cache_key={cache_key} | original={market_slug} | "
+                    f"status={'positive' if cached_data else 'negative'}"
+                )
+                return cached_data
 
         candidate_slugs = self._generate_slug_candidates(market_slug)
+        logger.debug(
+            f"Market info lookup candidates: original={market_slug} | canonical={cache_key} | "
+            f"candidates={candidate_slugs}"
+        )
         
         data = None
         for candidate_slug in candidate_slugs:
@@ -634,10 +664,28 @@ class PolymarketAPIClient:
                     first = payload[0]
                     if isinstance(first, dict):
                         data = first
+                        logger.debug(
+                            f"Market info resolved from candidate: original={market_slug} | "
+                            f"candidate={candidate_slug} | payload_type=list"
+                        )
                         break
                 elif isinstance(payload, dict):
                     data = payload
+                    logger.debug(
+                        f"Market info resolved from candidate: original={market_slug} | "
+                        f"candidate={candidate_slug} | payload_type=dict"
+                    )
                     break
+                else:
+                    logger.debug(
+                        f"Market info candidate had unsupported payload shape: original={market_slug} | "
+                        f"candidate={candidate_slug} | payload_type={type(payload).__name__}"
+                    )
+            else:
+                logger.debug(
+                    f"Market info candidate returned empty payload: original={market_slug} | "
+                    f"candidate={candidate_slug}"
+                )
 
         if not data:
             previous = cache_entry or {}
@@ -654,13 +702,13 @@ class PolymarketAPIClient:
             if should_warn:
                 logger.warning(
                     f"Market not found in Gamma API: original={market_slug}, "
-                    f"tried={candidate_slugs}"
+                    f"canonical={cache_key}, tried={candidate_slugs}, failures={fail_count}"
                 )
                 last_warning_at = now
             else:
                 logger.debug(
                     f"Market lookup unresolved (suppressed): original={market_slug}, "
-                    f"tried={candidate_slugs}, failures={fail_count}"
+                    f"canonical={cache_key}, tried={candidate_slugs}, failures={fail_count}"
                 )
 
             negative_ttl = max(5, int(Config.MARKET_INFO_NEGATIVE_CACHE_SECONDS))
@@ -1212,6 +1260,7 @@ class PolymarketAPIClient:
         outcome: str,
         strict: bool = False,
         allow_fuzzy: Optional[bool] = None,
+        caller_context: Optional[str] = None,
     ) -> Optional[str]:
         # Docstring removed to fix unterminated triple-quoted string error
         from utils import normalize_outcome_to_yes_no
@@ -1222,5 +1271,6 @@ class PolymarketAPIClient:
             logger,
             strict=strict,
             allow_fuzzy=allow_fuzzy,
+            caller_context=caller_context,
         )
 

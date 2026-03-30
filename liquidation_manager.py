@@ -134,7 +134,11 @@ class LiquidationManager:
             normalized_outcome = outcome
             outcome_lower = str(outcome or "").strip().lower()
             if outcome_lower not in ("yes", "no"):
-                resolved = await self.api_client.normalize_outcome_to_yes_no(market_slug, outcome)
+                resolved = await self.api_client.normalize_outcome_to_yes_no(
+                    market_slug,
+                    outcome,
+                    caller_context="liquidation_reconcile",
+                )
                 if resolved:
                     self.position_manager.reconcile_outcome_alias(
                         market_slug=market_slug,
@@ -320,7 +324,11 @@ class LiquidationManager:
                     api_outcome_normalized = api_outcome_raw.lower()
                     if api_outcome_normalized not in ("yes", "no"):
                         # Try to normalize team name to yes/no
-                        normalized = await self.api_client.normalize_outcome_to_yes_no(api_market, api_outcome_raw)
+                        normalized = await self.api_client.normalize_outcome_to_yes_no(
+                            api_market,
+                            api_outcome_raw,
+                            caller_context="liquidation_preflight",
+                        )
                         if normalized:
                             api_outcome_normalized = normalized
                     

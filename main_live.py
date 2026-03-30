@@ -73,12 +73,13 @@ class LiveTradingBot:
         self._selected_at_by_wallet_epoch: dict[str, float] = {}
 
     def _is_us_market_temporarily_untradable(self, market_slug: str) -> bool:
-        expires_at = self._us_untradable_until.get(market_slug)
+        normalized_slug = self._normalize_market_slug(market_slug)
+        expires_at = self._us_untradable_until.get(normalized_slug)
         if not expires_at:
             return False
         if datetime.now(timezone.utc) >= expires_at:
-            self._us_untradable_until.pop(market_slug, None)
-            self._us_untradable_reasons.pop(market_slug, None)
+            self._us_untradable_until.pop(normalized_slug, None)
+            self._us_untradable_reasons.pop(normalized_slug, None)
             return False
         return True
 
@@ -118,8 +119,9 @@ class LiveTradingBot:
 
         expires_at = datetime.now(timezone.utc).replace(microsecond=0)
         expires_at = expires_at + timedelta(seconds=ttl_seconds)
-        self._us_untradable_until[market_slug] = expires_at
-        self._us_untradable_reasons[market_slug] = sorted(reason_set)
+        normalized_slug = self._normalize_market_slug(market_slug)
+        self._us_untradable_until[normalized_slug] = expires_at
+        self._us_untradable_reasons[normalized_slug] = sorted(reason_set)
         self._log_unavailable_market_once(
             market_slug,
             "unavailable_us",
@@ -127,17 +129,21 @@ class LiveTradingBot:
         )
 
     def _clear_us_market_untradable(self, market_slug: str):
-        if market_slug in self._us_untradable_until:
-            self._us_untradable_until.pop(market_slug, None)
-            self._us_untradable_reasons.pop(market_slug, None)
+        normalized_slug = self._normalize_market_slug(market_slug)
+        if normalized_slug in self._us_untradable_until:
+            self._us_untradable_until.pop(normalized_slug, None)
+            self._us_untradable_reasons.pop(normalized_slug, None)
             logger.info(f"Removed US-untradable cache for market: {market_slug}")
 
     @staticmethod
     def _normalize_market_slug(slug: str) -> str:
         value = str(slug or "").strip().lower()
-        if value.startswith("aec-"):
-            return value[4:]
-        return value
+        if not value:
+            return ""
+        parts = [p for p in value.split("-") if p]
+        while len(parts) > 1 and parts[0] in {"aec", "asc", "asm", "acm", "acx"}:
+            parts = parts[1:]
+        return "-".join(parts)
 
     @staticmethod
     def _short_wallet(wallet: str | None) -> str:
@@ -323,7 +329,11 @@ class LiveTradingBot:
 
             pos_outcome = pos_outcome_raw.lower()
             if pos_outcome not in ("yes", "no"):
-                normalized = await self.api_client.normalize_outcome_to_yes_no(market_slug, pos_outcome_raw)
+                normalized = await self.api_client.normalize_outcome_to_yes_no(
+                    market_slug,
+                    pos_outcome_raw,
+                    caller_context="startup_position_normalization",
+                )
                 if normalized:
                     pos_outcome = normalized.lower()
 
@@ -580,7 +590,8 @@ class LiveTradingBot:
         if not trades:
             return
 
-        logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)}")
+        skipped_reasons: list[str] = []
+        logger_summary_parts: list[str] = []
 
         trades = self._filter_largest_buy_per_cycle(trades, wallet)
 
@@ -599,10 +610,32 @@ class LiveTradingBot:
                     f"Possible duplicate trade processing detected: {market_key} | "
                     f"Count={count} trades in single poll | Trader={self._trader_label(wallet)}"
                 )
-        
+
         unavailable_markets_logged: set[str] = set()
+
+        async def process_trade_with_reason(trade, wallet, unavailable_markets_logged, skipped_reasons):
+            # Wraps _process_trade to capture skip reasons
+            try:
+                # Patch points: add hooks for skip reasons in _handle_buy_signal/_handle_sell_signal
+                trade['_skip_reason_hook'] = skipped_reasons
+                await self._process_trade(trade, wallet, unavailable_markets_logged)
+            finally:
+                trade.pop('_skip_reason_hook', None)
+
         for trade in trades:
-            await self._process_trade(trade, wallet, unavailable_markets_logged)
+            await process_trade_with_reason(trade, wallet, unavailable_markets_logged, skipped_reasons)
+
+        # Summarize skipped reasons
+        from collections import Counter
+        reason_counter = Counter(skipped_reasons)
+        for reason, count in reason_counter.items():
+            logger_summary_parts.append(f"{count} {reason}")
+
+        summary_str = " | ".join(logger_summary_parts)
+        if summary_str:
+            logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)} | {summary_str}")
+        else:
+            logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)}")
 
     async def _trade_poll_loop(self):
         """High-frequency tracked-account polling loop."""
@@ -749,8 +782,14 @@ class LiveTradingBot:
             
             # Verify it's a sports market (US API limitation)
             if not is_sports_market(market_slug):
+                skip_hook = trade.get('_skip_reason_hook')
                 if not self._is_non_sports_market_cached(market_slug):
                     self._cache_non_sports_market(market_slug)
+                    if skip_hook is not None:
+                        skip_hook.append("BUY non-sports market")
+                else:
+                    if skip_hook is not None:
+                        skip_hook.append("BUY non-sports market (cached)")
                 return
             
             # Handle based on side
@@ -763,6 +802,7 @@ class LiveTradingBot:
                     market_slug,
                     outcome,
                     trader_wallet,
+                    trade,
                     observed_price=observed_price if observed_price > 0 else None,
                     observed_size=observed_size if observed_size > 0 else None,
                     unavailable_markets_logged=unavailable_markets_logged,
@@ -774,6 +814,7 @@ class LiveTradingBot:
                     market_slug,
                     outcome,
                     trader_wallet=trader_wallet,
+                    trade=trade,
                     observed_size=observed_size if observed_size > 0 else None,
                 )
             
@@ -785,6 +826,7 @@ class LiveTradingBot:
         market_slug: str,
         outcome: str,
         trader_wallet: str,
+        trade: dict,
         observed_price: float | None = None,
         observed_size: float | None = None,
         unavailable_markets_logged: set[str] | None = None,
@@ -803,6 +845,7 @@ class LiveTradingBot:
             outcome,
             strict=False,
             allow_fuzzy=False,
+            caller_context="buy_signal",
         )
         if not normalized_outcome:
             logger.warning(f"Cannot normalize outcome for buy: {market_slug} | {outcome}")
@@ -810,6 +853,9 @@ class LiveTradingBot:
 
         if observed_price is not None and observed_price > 0:
             if observed_price < Config.MIN_BUY_PRICE or observed_price > Config.MAX_BUY_PRICE:
+                skip_hook = trade.get('_skip_reason_hook')
+                if skip_hook is not None:
+                    skip_hook.append("BUY outside range")
                 return
 
         if self._is_us_market_temporarily_untradable(market_slug):
@@ -818,6 +864,9 @@ class LiveTradingBot:
                 "unavailable_us_cached",
                 unavailable_markets_logged,
             )
+            skip_hook = trade.get('_skip_reason_hook')
+            if skip_hook is not None:
+                skip_hook.append("BUY unavailable market")
             return
 
         self.position_manager.reconcile_outcome_alias(
@@ -834,9 +883,15 @@ class LiveTradingBot:
         current_buy_price = await self.api_client.get_best_price(market_slug, "buy", normalized_outcome)
         if current_buy_price is None or current_buy_price <= 0:
             logger.warning(f"Cannot get buy price for {market_slug} | {normalized_outcome}")
+            skip_hook = trade.get('_skip_reason_hook')
+            if skip_hook is not None:
+                skip_hook.append("BUY unavailable market")
             return
 
         if current_buy_price < Config.MIN_BUY_PRICE or current_buy_price > Config.MAX_BUY_PRICE:
+            skip_hook = trade.get('_skip_reason_hook')
+            if skip_hook is not None:
+                skip_hook.append("BUY outside range")
             return
 
         balance = self.position_manager.balance
@@ -864,6 +919,9 @@ class LiveTradingBot:
         investment_amount = min(base_notional * multiplier, trade_notional_cap)
         if investment_amount <= 0:
             logger.warning("Computed non-positive investment; skipping")
+            skip_hook = trade.get('_skip_reason_hook')
+            if skip_hook is not None:
+                skip_hook.append("BUY outside range")
             return
 
         can_open, reason = self.position_manager.can_open_position(market_slug, investment_amount)
@@ -876,6 +934,9 @@ class LiveTradingBot:
                 f"Current=${current_exposure:.2f} | Proposed=${investment_amount:.2f} | "
                 f"Cap=${market_cap:.2f} | Reason: {reason}"
             )
+            skip_hook = trade.get('_skip_reason_hook')
+            if skip_hook is not None:
+                skip_hook.append("BUY outside range")
             return
 
         target_shares = investment_amount / current_buy_price
@@ -1002,7 +1063,11 @@ class LiveTradingBot:
             market_slug: Market slug
             outcome: Outcome
         """
-        normalized_outcome = await self.api_client.normalize_outcome_to_yes_no(market_slug, outcome)
+        normalized_outcome = await self.api_client.normalize_outcome_to_yes_no(
+            market_slug,
+            outcome,
+            caller_context="sell_signal",
+        )
         if not normalized_outcome:
             logger.warning(f"Cannot normalize outcome for sell: {market_slug} | {outcome}")
             return
@@ -1016,6 +1081,9 @@ class LiveTradingBot:
         # Check if we have a position
         if not self.position_manager.has_position(market_slug, normalized_outcome):
             logger.debug(f"No position in {market_slug} | {normalized_outcome}, skipping sell signal")
+            skip_hook = locals().get('skipped_reasons') or trade.get('_skip_reason_hook')
+            if skip_hook is not None:
+                skip_hook.append("Unowned SELL")
             return
         
         position = self.position_manager.get_position(market_slug, normalized_outcome)

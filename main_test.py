@@ -76,12 +76,13 @@ class TestTradingBot:
         self._selected_at_by_wallet_epoch: dict[str, float] = {}
 
     def _is_us_market_temporarily_untradable(self, market_slug: str) -> bool:
-        expires_at = self._us_untradable_until.get(market_slug)
+        normalized_slug = self._normalize_market_slug(market_slug)
+        expires_at = self._us_untradable_until.get(normalized_slug)
         if not expires_at:
             return False
         if datetime.now(timezone.utc) >= expires_at:
-            self._us_untradable_until.pop(market_slug, None)
-            self._us_untradable_reasons.pop(market_slug, None)
+            self._us_untradable_until.pop(normalized_slug, None)
+            self._us_untradable_reasons.pop(normalized_slug, None)
             return False
         return True
 
@@ -101,8 +102,9 @@ class TestTradingBot:
 
         expires_at = datetime.now(timezone.utc).replace(microsecond=0)
         expires_at = expires_at + timedelta(seconds=ttl_seconds)
-        self._us_untradable_until[market_slug] = expires_at
-        self._us_untradable_reasons[market_slug] = sorted(reason_set)
+        normalized_slug = self._normalize_market_slug(market_slug)
+        self._us_untradable_until[normalized_slug] = expires_at
+        self._us_untradable_reasons[normalized_slug] = sorted(reason_set)
         self._log_unavailable_market_once(
             market_slug,
             "unavailable_us",
@@ -129,9 +131,12 @@ class TestTradingBot:
     @staticmethod
     def _normalize_market_slug(slug: str) -> str:
         value = str(slug or "").strip().lower()
-        if value.startswith("aec-"):
-            return value[4:]
-        return value
+        if not value:
+            return ""
+        parts = [p for p in value.split("-") if p]
+        while len(parts) > 1 and parts[0] in {"aec", "asc", "asm", "acm", "acx"}:
+            parts = parts[1:]
+        return "-".join(parts)
 
     def _is_non_sports_market_cached(self, market_slug: str) -> bool:
         normalized_slug = self._normalize_market_slug(market_slug)
@@ -409,7 +414,11 @@ class TestTradingBot:
 
             pos_outcome = pos_outcome_raw.lower()
             if pos_outcome not in ("yes", "no"):
-                normalized = await self.api_client.normalize_outcome_to_yes_no(market_slug, pos_outcome_raw)
+                normalized = await self.api_client.normalize_outcome_to_yes_no(
+                    market_slug,
+                    pos_outcome_raw,
+                    caller_context="startup_position_normalization",
+                )
                 if normalized:
                     pos_outcome = normalized.lower()
 
@@ -543,6 +552,9 @@ class TestTradingBot:
             return
 
         logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)}")
+        skipped_reasons: list[str] = []
+        logger_summary_parts: list[str] = []
+
         trades = self._filter_largest_buy_per_cycle(trades, wallet)
 
         trade_key_counts: dict[str, int] = {}
@@ -562,8 +574,27 @@ class TestTradingBot:
                 )
 
         unavailable_markets_logged: set[str] = set()
+
+        async def process_trade_with_reason(trade, wallet, unavailable_markets_logged, skipped_reasons):
+            try:
+                trade['_skip_reason_hook'] = skipped_reasons
+                await self._process_trade(trade, wallet, unavailable_markets_logged)
+            finally:
+                trade.pop('_skip_reason_hook', None)
+
         for trade in trades:
-            await self._process_trade(trade, wallet, unavailable_markets_logged)
+            await process_trade_with_reason(trade, wallet, unavailable_markets_logged, skipped_reasons)
+
+        from collections import Counter
+        reason_counter = Counter(skipped_reasons)
+        for reason, count in reason_counter.items():
+            logger_summary_parts.append(f"{count} {reason}")
+
+        summary_str = " | ".join(logger_summary_parts)
+        if summary_str:
+            logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)} | {summary_str}")
+        else:
+            logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)}")
 
     async def _trade_poll_loop(self):
         """High-frequency tracked-account polling loop (test mode)."""
@@ -719,6 +750,7 @@ class TestTradingBot:
             outcome,
             strict=False,
             allow_fuzzy=False,
+            caller_context="buy_signal",
         )
         if not normalized_outcome:
             logger.warning(f"Cannot normalize outcome for buy: {market_slug} | {outcome}")
@@ -926,7 +958,11 @@ class TestTradingBot:
             market_slug: Market slug
             outcome: Outcome
         """
-        normalized_outcome = await self.api_client.normalize_outcome_to_yes_no(market_slug, outcome)
+        normalized_outcome = await self.api_client.normalize_outcome_to_yes_no(
+            market_slug,
+            outcome,
+            caller_context="sell_signal",
+        )
         if not normalized_outcome:
             logger.warning(f"Cannot normalize outcome for sell: {market_slug} | {outcome}")
             return
