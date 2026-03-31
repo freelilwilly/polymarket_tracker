@@ -167,6 +167,19 @@ class LiveTradingBot:
         label = str(self._trader_display_names.get(value) or "").strip()
         return label or self._short_wallet(value)
 
+    def _get_trader_frequency(self, wallet: str) -> float | None:
+        """Get avg_trades_per_day for a trader from selected_traders metadata."""
+        normalized = str(wallet or "").strip().lower()
+        if not normalized:
+            return None
+        
+        for trader in self.selected_traders:
+            trader_wallet = str(trader.get("wallet") or "").strip().lower()
+            if trader_wallet == normalized:
+                return to_float(trader.get("avg_trades_per_day"), default=None)
+        
+        return None
+
     def _log_unavailable_market_once(
         self,
         market_slug: str,
@@ -414,14 +427,59 @@ class LiveTradingBot:
             created_at = record.get("created_at") if isinstance(record.get("created_at"), datetime) else now
             age_seconds = (now - created_at).total_seconds()
             if age_seconds > max(30, Config.BUY_PENDING_RECONCILE_SECONDS):
-                logger.warning(
-                    f"Pending BUY reconciliation timeout: {record.get('market_slug')} | {record.get('outcome')} | "
-                    f"order_id={order_id}"
-                )
+                # Before abandoning, attempt to recover owner link for unattributed shares
+                market_slug = str(record.get("market_slug") or "")
+                outcome = str(record.get("outcome") or "")
+                trader_wallet = str(record.get("trader_wallet") or "")
+                
+                recovery_attempted = False
+                if market_slug and outcome and trader_wallet:
+                    position = self.position_manager.get_position(market_slug, outcome)
+                    if position:
+                        total_shares = max(0.0, to_float(position.get("shares"), default=0.0))
+                        trader_shares = position.get("trader_shares", {})
+                        attributed_shares = sum(to_float(s, default=0.0) for s in trader_shares.values())
+                        unattributed_shares = total_shares - attributed_shares
+                        
+                        if unattributed_shares > 0.01:  # Small threshold for float precision
+                            linked = self.position_manager.set_position_monitored_trader(
+                                market_slug, outcome, trader_wallet
+                            )
+                            if linked:
+                                logger.info(
+                                    f"Recovered owner link on reconciliation timeout: {market_slug} | {outcome} | "
+                                    f"unattributed_shares={unattributed_shares:.2f} | order_id={order_id}"
+                                )
+                                recovery_attempted = True
+                        else:
+                            logger.debug(
+                                f"Position fully attributed, skipping timeout recovery: {market_slug} | {outcome} | "
+                                f"order_id={order_id}"
+                            )
+                
+                if not recovery_attempted:
+                    logger.warning(
+                        f"Pending BUY reconciliation timeout: {record.get('market_slug')} | {record.get('outcome')} | "
+                        f"order_id={order_id}"
+                    )
+                
                 self._pending_buy_orders.pop(order_id, None)
                 continue
 
-            details = await self.api_client.get_order_details(order_id)
+            # Fetch order details with exception handling to prevent reconciliation loop failure
+            try:
+                details = await self.api_client.get_order_details(order_id)
+            except Exception as e:
+                logger.warning(
+                    f"Error fetching order details during reconciliation: {order_id} | {e}"
+                )
+                # Treat as still pending; will retry on next reconciliation cycle
+                checks = int(record.get("checks") or 0) + 1
+                record["checks"] = checks
+                record["next_check_at"] = now + timedelta(seconds=max(5, Config.BUY_PENDING_RECHECK_SECONDS))
+                self._pending_buy_orders[order_id] = record
+                continue
+            
             state, cum_qty, avg_px = self._parse_order_execution(details)
 
             market_slug = str(record.get("market_slug") or "")
@@ -916,6 +974,23 @@ class LiveTradingBot:
             return
 
         base_notional = balance * Config.BASE_RISK_PERCENT
+        
+        # Apply frequency-based scaling to equalize daily allocation across traders
+        if Config.FREQUENCY_WEIGHTING_ENABLED:
+            trader_frequency = self._get_trader_frequency(trader_wallet)
+            if trader_frequency and trader_frequency > 0:
+                frequency_factor = Config.FREQUENCY_REFERENCE_TRADES_PER_DAY / trader_frequency
+                frequency_factor = max(
+                    Config.FREQUENCY_MIN_SCALING_FACTOR,
+                    min(Config.FREQUENCY_MAX_SCALING_FACTOR, frequency_factor)
+                )
+                base_notional = base_notional * frequency_factor
+                logger.debug(
+                    f"Frequency-adjusted base: {trader_wallet[:8]} | "
+                    f"freq={trader_frequency:.1f}/day | factor={frequency_factor:.2f}x | "
+                    f"base=${base_notional:.2f}"
+                )
+        
         history = self.trade_monitor.get_size_history(trader_wallet)
         effective_observed_size = observed_size if (observed_size and observed_size > 0) else base_notional
         wallet_median = median(history)
@@ -942,17 +1017,17 @@ class LiveTradingBot:
 
         can_open, reason = self.position_manager.can_open_position(market_slug, investment_amount)
         if not can_open:
-            # Phase 2: Enhanced market cap logging
+            # Market cap protection - log at debug level, summary will show "market cap exceeded"
             current_exposure = self.position_manager.get_market_exposure(market_slug)
             market_cap = balance * Config.MAX_POSITION_SIZE_PER_MARKET
-            logger.warning(
+            logger.debug(
                 f"Market cap protection blocked BUY: {market_slug} | {normalized_outcome} | "
                 f"Current=${current_exposure:.2f} | Proposed=${investment_amount:.2f} | "
                 f"Cap=${market_cap:.2f} | Reason: {reason}"
             )
             skip_hook = trade.get('_skip_reason_hook')
             if skip_hook is not None:
-                skip_hook.append("BUY outside range")
+                skip_hook.append("market cap exceeded")
             return
 
         target_shares = investment_amount / current_buy_price
@@ -1070,6 +1145,7 @@ class LiveTradingBot:
         market_slug: str,
         outcome: str,
         trader_wallet: str | None = None,
+        trade: dict | None = None,
         observed_size: float | None = None,
     ):
         """
@@ -1097,7 +1173,7 @@ class LiveTradingBot:
         # Check if we have a position
         if not self.position_manager.has_position(market_slug, normalized_outcome):
             logger.debug(f"No position in {market_slug} | {normalized_outcome}, skipping sell signal")
-            skip_hook = locals().get('skipped_reasons') or trade.get('_skip_reason_hook')
+            skip_hook = trade.get('_skip_reason_hook') if trade else None
             if skip_hook is not None:
                 skip_hook.append("Unowned SELL")
             return

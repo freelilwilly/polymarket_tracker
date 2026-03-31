@@ -455,6 +455,19 @@ class TestTradingBot:
         label = str(self._trader_display_names.get(value) or "").strip()
         return label or self._short_wallet(value)
 
+    def _get_trader_frequency(self, wallet: str) -> float | None:
+        """Get avg_trades_per_day for a trader from selected_traders metadata."""
+        normalized = str(wallet or "").strip().lower()
+        if not normalized:
+            return None
+        
+        for trader in self.selected_traders:
+            trader_wallet = str(trader.get("wallet") or "").strip().lower()
+            if trader_wallet == normalized:
+                return to_float(trader.get("avg_trades_per_day"), default=None)
+        
+        return None
+
     async def _refresh_selected_traders(self):
         """Refresh monitored traders and warm up monitor state."""
         logger.info("Refreshing selected traders...")
@@ -737,6 +750,7 @@ class TestTradingBot:
                     market_slug,
                     outcome,
                     trader_wallet=trader_wallet,
+                    trade=trade,
                     observed_size=observed_size if observed_size > 0 else None,
                 )
             
@@ -829,6 +843,23 @@ class TestTradingBot:
             return
 
         base_notional = balance * Config.BASE_RISK_PERCENT
+        
+        # Apply frequency-based scaling to equalize daily allocation across traders
+        if Config.FREQUENCY_WEIGHTING_ENABLED:
+            trader_frequency = self._get_trader_frequency(trader_wallet)
+            if trader_frequency and trader_frequency > 0:
+                frequency_factor = Config.FREQUENCY_REFERENCE_TRADES_PER_DAY / trader_frequency
+                frequency_factor = max(
+                    Config.FREQUENCY_MIN_SCALING_FACTOR,
+                    min(Config.FREQUENCY_MAX_SCALING_FACTOR, frequency_factor)
+                )
+                base_notional = base_notional * frequency_factor
+                logger.debug(
+                    f"Frequency-adjusted base: {trader_wallet[:8]} | "
+                    f"freq={trader_frequency:.1f}/day | factor={frequency_factor:.2f}x | "
+                    f"base=${base_notional:.2f}"
+                )
+        
         # Use observed trade-size percentile normalization from monitored wallet history.
         history = self.trade_monitor.get_size_history(trader_wallet)
         effective_observed_size = observed_size if (observed_size and observed_size > 0) else base_notional
@@ -965,6 +996,7 @@ class TestTradingBot:
         market_slug: str,
         outcome: str,
         trader_wallet: str | None = None,
+        trade: dict | None = None,
         observed_size: float | None = None,
     ):
         """
@@ -992,6 +1024,9 @@ class TestTradingBot:
         # Check if we have a position
         if not self.position_manager.has_position(market_slug, normalized_outcome):
             logger.debug(f"No position in {market_slug} | {normalized_outcome}, skipping sell signal")
+            skip_hook = trade.get('_skip_reason_hook') if trade else None
+            if skip_hook is not None:
+                skip_hook.append("Unowned SELL")
             return
         
         position = self.position_manager.get_position(market_slug, normalized_outcome)

@@ -85,6 +85,12 @@ class Config:
     TAIL_LOW_SIZE_HAIRCUT_MIN_FACTOR: float = float(os.getenv("TAIL_LOW_SIZE_HAIRCUT_MIN_FACTOR", "0.35"))  # Min haircut factor
     TAIL_MAX_TRADE_NOTIONAL_PCT: float = float(os.getenv("TAIL_MAX_TRADE_NOTIONAL_PCT", "0.08"))        # Max 8% per trade
 
+    # Frequency-Weighted Unit Sizing
+    FREQUENCY_WEIGHTING_ENABLED: bool = os.getenv("FREQUENCY_WEIGHTING_ENABLED", "true").lower() in ("true", "1", "yes")
+    FREQUENCY_REFERENCE_TRADES_PER_DAY: float = float(os.getenv("FREQUENCY_REFERENCE_TRADES_PER_DAY", "10.0"))
+    FREQUENCY_MIN_SCALING_FACTOR: float = float(os.getenv("FREQUENCY_MIN_SCALING_FACTOR", "0.20"))
+    FREQUENCY_MAX_SCALING_FACTOR: float = float(os.getenv("FREQUENCY_MAX_SCALING_FACTOR", "2.0"))
+
     # Test Mode Configuration
     TEST_EXCEL_WORKBOOK: str = os.getenv("TEST_EXCEL_WORKBOOK", "test_performance.xlsx")
     TEST_POSITION_STATE_FILE: str = os.getenv("TEST_POSITION_STATE_FILE", "test_positions_state.json")

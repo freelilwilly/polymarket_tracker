@@ -261,7 +261,7 @@ class PositionManager:
                                 existing_owner = str(existing.get("monitored_trader") or "").strip()
                                 incoming_owner = str(normalized_pos.get("monitored_trader") or "").strip()
                                 if not existing_owner and incoming_owner:
-                                    existing["monitored_trader"] = incoming_owner
+                                    existing["monitored_trader"] = incoming_owner.lower() or None
 
                                 existing_trader_shares = self._normalize_trader_shares(existing.get("trader_shares"))
                                 incoming_trader_shares = self._normalize_trader_shares(normalized_pos.get("trader_shares"))
@@ -454,14 +454,16 @@ class PositionManager:
 
         # If canonical trader is missing, carry over alias trader for traceability.
         if not canonical_pos.get("monitored_trader") and alias_pos.get("monitored_trader"):
-            canonical_pos["monitored_trader"] = alias_pos.get("monitored_trader")
+            alias_owner = str(alias_pos.get("monitored_trader") or "").strip().lower()
+            canonical_pos["monitored_trader"] = alias_owner or None
 
         canonical_trader_shares = self._ensure_position_trader_shares(canonical_pos)
         alias_trader_shares = self._ensure_position_trader_shares(alias_pos)
         merged_trader_shares = self._merge_trader_shares(canonical_trader_shares, alias_trader_shares)
         canonical_pos["trader_shares"] = merged_trader_shares
         primary_owner = self._pick_primary_owner(merged_trader_shares)
-        canonical_pos["monitored_trader"] = primary_owner or canonical_pos.get("monitored_trader")
+        current_owner = str(canonical_pos.get("monitored_trader") or "").strip().lower() or None
+        canonical_pos["monitored_trader"] = primary_owner or current_owner
 
         self.positions.pop(alias_key, None)
         self.positions[canonical_key] = canonical_pos
@@ -655,6 +657,14 @@ class PositionManager:
             logger.warning(f"Cannot close position: not found ({key})")
             return None
         
+        position = self.positions[key]
+        
+        # Cache owner information before removal for potential recovery
+        monitored_trader = position.get("monitored_trader")
+        shares = position.get("shares", 0.0)
+        self.remember_recent_owner(market_slug, outcome, monitored_trader, shares)
+        
+        # Now remove the position
         position = self.positions.pop(key)
         
         # Calculate P&L
