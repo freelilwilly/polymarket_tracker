@@ -815,16 +815,14 @@ class LiveTradingBot:
             logger_summary_parts.append(f"{count} {reason}")
 
         summary_str = " | ".join(logger_summary_parts)
-        processed_count = len(trades)
         if summary_str:
             logger.info(
                 f"Found {polled_trade_count} new trade(s) from {self._trader_label(wallet)} | "
-                f"processed={processed_count} | {summary_str}"
+                f"{summary_str}"
             )
         else:
             logger.info(
-                f"Found {polled_trade_count} new trade(s) from {self._trader_label(wallet)} | "
-                f"processed={processed_count}"
+                f"Found {polled_trade_count} new trade(s) from {self._trader_label(wallet)}"
             )
 
     async def _trade_poll_loop(self):

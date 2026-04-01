@@ -175,56 +175,10 @@ class TradeExecutor:
                     "shares": target_shares,
                 }
             
-            # Execute actual buy order (LIVE MODE)
-            # Place order via US API
-            order_price_preview = max(0.01, min(0.99, current_price))
-            if order_price_preview > current_price:
-                logger.warning(
-                    f"BUY order price floor applied by US API path: {market_slug} | "
-                    f"quoted=${current_price:.4f} -> order=${order_price_preview:.4f}"
-                )
-
-            order_result = await self.api_client.place_order(
-                market_slug=market_slug,
-                outcome=normalized_outcome,
-                side="BUY",
-                shares=target_shares,
-                price=current_price,
-            )
-            
-            if not order_result:
-                order_error = self.api_client.last_order_error or {}
-                status = order_error.get("status")
-                message = str(order_error.get("message") or "").lower()
-                candidate_slugs = order_error.get("candidate_slugs") or []
-
-                market_unavailable_reasons = []
-                if self.api_client._is_market_not_found_error(order_error):
-                    market_unavailable_reasons.append("MARKET_NOT_FOUND")
-                if "not tradable" in message:
-                    market_unavailable_reasons.append("NOT_TRADABLE")
-                if "asset not found" in message:
-                    market_unavailable_reasons.append("ASSET_NOT_FOUND")
-
-                # "symbol is required" has proven to be noisy/ambiguous in the US API;
-                # do not treat it as definitive market-unavailable signal.
-                if status in (400, 404) and market_unavailable_reasons:
-                    logger.info(
-                        f"US market unavailable for trading, skipping: {market_slug} | "
-                        f"status={status} | reasons={','.join(market_unavailable_reasons)}"
-                    )
-                    return {
-                        "skipped": True,
-                        "reason": "US_MARKET_UNAVAILABLE",
-                        "status": status,
-                        "market_unavailable_reasons": market_unavailable_reasons,
-                        "candidate_slugs": candidate_slugs,
-                    }
-
-                logger.warning(f"Order placement failed for {market_slug}")
-                return None
-
-            order_id = order_result.get("order_id")
+            # Execute actual buy order (LIVE MODE) as market-style IOC only.
+            # Keep tolerance check above, then use aggressive limit + IOC so the
+            # order either fills immediately or cancels without resting on book.
+            ioc_price = 0.99
 
             async def _fetch_buy_execution(order_id_value: str) -> dict[str, Any]:
                 """Poll order details with short backoff and return buy execution summary."""
@@ -286,13 +240,97 @@ class TradeExecutor:
                     "avg_px": max(0.0, avg_px),
                 }
 
-            execution = {"state": "", "cum_qty": 0.0, "avg_px": 0.0}
-            if order_id:
-                execution = await _fetch_buy_execution(str(order_id))
+            async def _submit_buy_ioc(convert_no_price: bool) -> Optional[dict[str, Any]]:
+                order_result = await self.api_client.place_order(
+                    market_slug=market_slug,
+                    outcome=normalized_outcome,
+                    side="BUY",
+                    shares=target_shares,
+                    price=ioc_price,
+                    tif="TIME_IN_FORCE_IMMEDIATE_OR_CANCEL",
+                    order_type="ORDER_TYPE_LIMIT",
+                    convert_no_price=convert_no_price,
+                )
+                if not order_result:
+                    return None
 
-            filled_qty = to_float(execution.get("cum_qty"), default=0.0)
-            avg_fill_px = to_float(execution.get("avg_px"), default=0.0)
-            order_state = str(execution.get("state") or "")
+                order_id = order_result.get("order_id")
+                execution = {"state": "", "cum_qty": 0.0, "avg_px": 0.0}
+                if order_id:
+                    execution = await _fetch_buy_execution(str(order_id))
+
+                return {
+                    "order_id": order_id,
+                    "execution": execution,
+                }
+
+            first_attempt = await _submit_buy_ioc(convert_no_price=True)
+            used_no_basis_fallback = False
+            if not first_attempt and is_no_side:
+                # Some venues/environments interpret short-side price basis differently.
+                first_attempt = await _submit_buy_ioc(convert_no_price=False)
+                used_no_basis_fallback = True
+
+            if not first_attempt:
+                order_error = self.api_client.last_order_error or {}
+                status = order_error.get("status")
+                message = str(order_error.get("message") or "").lower()
+                candidate_slugs = order_error.get("candidate_slugs") or []
+
+                market_unavailable_reasons = []
+                if self.api_client._is_market_not_found_error(order_error):
+                    market_unavailable_reasons.append("MARKET_NOT_FOUND")
+                if "not tradable" in message:
+                    market_unavailable_reasons.append("NOT_TRADABLE")
+                if "asset not found" in message:
+                    market_unavailable_reasons.append("ASSET_NOT_FOUND")
+
+                # "symbol is required" has proven to be noisy/ambiguous in the US API;
+                # do not treat it as definitive market-unavailable signal.
+                if status in (400, 404) and market_unavailable_reasons:
+                    logger.info(
+                        f"US market unavailable for trading, skipping: {market_slug} | "
+                        f"status={status} | reasons={','.join(market_unavailable_reasons)}"
+                    )
+                    return {
+                        "skipped": True,
+                        "reason": "US_MARKET_UNAVAILABLE",
+                        "status": status,
+                        "market_unavailable_reasons": market_unavailable_reasons,
+                        "candidate_slugs": candidate_slugs,
+                    }
+
+                logger.warning(f"Order placement failed for {market_slug}")
+                return None
+
+            order_ids: list[str] = []
+            first_order_id = str(first_attempt.get("order_id") or "")
+            if first_order_id:
+                order_ids.append(first_order_id)
+
+            first_exec = first_attempt.get("execution") or {}
+            filled_qty = to_float(first_exec.get("cum_qty"), default=0.0)
+            avg_fill_px = to_float(first_exec.get("avg_px"), default=0.0)
+            order_state = str(first_exec.get("state") or "")
+
+            if is_no_side and filled_qty <= 0 and not used_no_basis_fallback:
+                retry_attempt = await _submit_buy_ioc(convert_no_price=False)
+                if retry_attempt:
+                    retry_order_id = str(retry_attempt.get("order_id") or "")
+                    if retry_order_id:
+                        order_ids.append(retry_order_id)
+
+                    retry_exec = retry_attempt.get("execution") or {}
+                    retry_filled = to_float(retry_exec.get("cum_qty"), default=0.0)
+                    retry_avg = to_float(retry_exec.get("avg_px"), default=0.0)
+                    retry_state = str(retry_exec.get("state") or "")
+                    if retry_filled > 0:
+                        filled_qty += retry_filled
+                        weighted_notional = (avg_fill_px * (filled_qty - retry_filled)) + (retry_avg * retry_filled)
+                        avg_fill_px = (weighted_notional / filled_qty) if filled_qty > 0 else 0.0
+                    order_state = retry_state or order_state
+
+            order_id = order_ids[-1] if order_ids else str(first_attempt.get("order_id") or "")
 
             if filled_qty <= 0:
                 logger.info(
@@ -309,7 +347,7 @@ class TradeExecutor:
                 }
             
             logger.info(
-                f"BUY executed: {market_slug} | {filled_qty:.2f}/{target_shares:.2f} shares "
+                f"BUY IOC executed: {market_slug} | {filled_qty:.2f}/{target_shares:.2f} shares "
                 f"@ {(avg_fill_px if avg_fill_px > 0 else current_price):.4f} | order_id={order_id}"
             )
             

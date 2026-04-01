@@ -39,7 +39,8 @@ class PolymarketAPIClient:
         "nor": "no",
         "sfo": "sf",
         "tam": "tb",
-        "nyk": "ny"
+        "nyk": "ny",
+        "wsh": "was"
     }
     # Reverse map for abbreviation lookup (e.g., "pho" -> "phx")
     TEAM_ABBREVIATION_REVERSE_MAP: dict[str, str] = {v: k for k, v in TEAM_ABBREVIATION_MAP.items()}
