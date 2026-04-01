@@ -39,6 +39,7 @@ class PolymarketAPIClient:
         "nor": "no",
         "sfo": "sf",
         "tam": "tb",
+        "nyk": "ny"
     }
     # Reverse map for abbreviation lookup (e.g., "pho" -> "phx")
     TEAM_ABBREVIATION_REVERSE_MAP: dict[str, str] = {v: k for k, v in TEAM_ABBREVIATION_MAP.items()}
@@ -529,7 +530,7 @@ class PolymarketAPIClient:
         self,
         wallet: str,
         limit: int = 200,
-    ) -> list[dict[str, Any]]:
+    ) -> Optional[list[dict[str, Any]]]:
         """
         Get current public positions for a user via Data API.
 
@@ -538,7 +539,8 @@ class PolymarketAPIClient:
             limit: Maximum positions to return
 
         Returns:
-            List of position dicts
+            List of position dicts, [] for successful empty response,
+            or None when the API request fails/unavailable.
         """
         url = f"{self.data_api_base}/positions"
         params = {
@@ -546,7 +548,23 @@ class PolymarketAPIClient:
             "limit": max(1, int(limit)),
         }
         data = await self._get_json(url, params=params)
-        return data if isinstance(data, list) else []
+
+        if data is None:
+            return None
+
+        if isinstance(data, list):
+            return data
+
+        # Defensive parse for alternate envelope shape.
+        if isinstance(data, dict):
+            payload_positions = data.get("positions")
+            if isinstance(payload_positions, list):
+                return payload_positions
+
+        logger.warning(
+            f"Unexpected positions payload shape for wallet {wallet}: {type(data).__name__}"
+        )
+        return None
 
     async def get_recent_global_trades(self, limit: int = 1000) -> list[dict[str, Any]]:
         """

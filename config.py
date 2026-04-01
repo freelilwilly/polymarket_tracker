@@ -75,6 +75,8 @@ class Config:
     # Copied SELL sizing behavior
     SELL_PERCENT_SIZING_ENABLED: bool = os.getenv("SELL_PERCENT_SIZING_ENABLED", "true").lower() in ("true", "1", "yes")
     SELL_PERCENT_FALLBACK_MAX_RATIO: float = float(os.getenv("SELL_PERCENT_FALLBACK_MAX_RATIO", "0.50"))
+    SELL_NEAR_FULL_RATIO_THRESHOLD: float = float(os.getenv("SELL_NEAR_FULL_RATIO_THRESHOLD", "0.95"))
+    COPIED_POSITIONS_CACHE_TTL_SECONDS: int = int(os.getenv("COPIED_POSITIONS_CACHE_TTL_SECONDS", "120"))
     
     # Size Normalization (percentile-based multiplier logic from polymarket_tracker)
     TAIL_MIN_MULTIPLIER: float = float(os.getenv("TAIL_MIN_MULTIPLIER", "0.9"))                         # Min multiplier (small trades)

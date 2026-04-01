@@ -74,6 +74,7 @@ class LiveTradingBot:
         self._trader_display_names: dict[str, str] = {}
         self._startup_bootstrap_pending_wallets: set[str] = set()
         self._selected_at_by_wallet_epoch: dict[str, float] = {}
+        self._copied_position_shares_cache: dict[str, dict[str, Any]] = {}
 
     def _is_us_market_temporarily_untradable(self, market_slug: str) -> bool:
         normalized_slug = self._normalize_market_slug(market_slug)
@@ -289,6 +290,77 @@ class LiveTradingBot:
 
         return [trade for idx, trade in indexed_trades if idx in kept_indices]
 
+    def _aggregate_sell_signals_per_cycle(
+        self,
+        trades: list[dict[str, Any]],
+        wallet: str,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Aggregate duplicate SELL signals per market/outcome within one poll cycle."""
+        if not trades:
+            return trades, 0
+
+        indexed_trades = list(enumerate(trades))
+        grouped_sells: dict[tuple[str, str], list[tuple[int, dict[str, Any]]]] = {}
+        kept_indices: set[int] = set()
+        replacements: dict[int, dict[str, Any]] = {}
+
+        for idx, trade in indexed_trades:
+            side = str(trade.get("side") or "").strip().upper()
+            if side != "SELL":
+                kept_indices.add(idx)
+                continue
+
+            market_slug = str(trade.get("market_slug") or "").strip()
+            outcome = str(trade.get("outcome") or "").strip()
+            if not market_slug or not outcome:
+                kept_indices.add(idx)
+                continue
+
+            key = (market_slug.lower(), outcome.lower())
+            grouped_sells.setdefault(key, []).append((idx, trade))
+
+        aggregated_count = 0
+        for (market_slug, outcome), entries in grouped_sells.items():
+            if len(entries) == 1:
+                kept_indices.add(entries[0][0])
+                continue
+
+            winner_idx = entries[0][0]
+            winner_trade = entries[0][1]
+            winner_ts = self._trade_timestamp_epoch(winner_trade)
+            merged_size = 0.0
+            for idx, trade in entries:
+                merged_size += max(0.0, to_float(trade.get("size"), default=0.0))
+                ts = self._trade_timestamp_epoch(trade)
+                if ts > winner_ts:
+                    winner_idx = idx
+                    winner_trade = trade
+                    winner_ts = ts
+
+            merged_trade = dict(winner_trade)
+            if merged_size > 0:
+                merged_trade["size"] = merged_size
+            merged_trade["_aggregated_sell_meta"] = {
+                "market_slug": market_slug,
+                "outcome": outcome,
+                "aggregated_count": len(entries),
+                "merged_size": merged_size,
+                "trader_label": self._trader_label(wallet),
+            }
+            replacements[winner_idx] = merged_trade
+            kept_indices.add(winner_idx)
+            aggregated_count += len(entries) - 1
+
+        if aggregated_count <= 0:
+            return trades, 0
+
+        filtered = [
+            replacements.get(idx, trade)
+            for idx, trade in indexed_trades
+            if idx in kept_indices
+        ]
+        return filtered, aggregated_count
+
     def _filter_startup_history_trades(
         self,
         trades: list[dict[str, Any]],
@@ -320,14 +392,39 @@ class LiveTradingBot:
         trader_wallet: str,
         market_slug: str,
         normalized_outcome: str,
-    ) -> float | None:
-        """Fetch copied trader's current position shares for the target market/outcome."""
+    ) -> tuple[float | None, str]:
+        """Fetch copied trader shares for market/outcome with cache fallback on API failure."""
+        cache_key = "|".join(
+            (
+                str(trader_wallet or "").strip().lower(),
+                self._normalize_market_slug(market_slug),
+                str(normalized_outcome or "").strip().lower(),
+            )
+        )
+
+        now = datetime.now(timezone.utc)
+        cache_ttl = max(1, int(Config.COPIED_POSITIONS_CACHE_TTL_SECONDS))
+        cached = self._copied_position_shares_cache.get(cache_key)
+
+        def _cache_value(value: float) -> None:
+            self._copied_position_shares_cache[cache_key] = {
+                "shares": max(0.0, to_float(value, default=0.0)),
+                "expires_at": now + timedelta(seconds=cache_ttl),
+            }
+
         positions = await self.api_client.get_user_positions(
             wallet=trader_wallet,
             limit=Config.TRADE_PAGE_SIZE,
         )
+        if positions is None:
+            if isinstance(cached, dict) and isinstance(cached.get("expires_at"), datetime):
+                if now < cached["expires_at"]:
+                    return max(0.0, to_float(cached.get("shares"), default=0.0)), "positions_api_cache_fallback"
+            return None, "positions_api_unavailable"
+
         if not positions:
-            return None
+            _cache_value(0.0)
+            return 0.0, "positions_api_empty_success"
 
         target_slug = self._normalize_market_slug(market_slug)
         target_outcome = str(normalized_outcome or "").strip().lower()
@@ -365,9 +462,12 @@ class LiveTradingBot:
             total_shares += max(0.0, to_float(pos.get("size"), default=0.0))
 
         if not matched:
-            return 0.0
+            _cache_value(0.0)
+            return 0.0, "positions_api_no_match"
 
-        return max(0.0, total_shares)
+        resolved = max(0.0, total_shares)
+        _cache_value(resolved)
+        return resolved, "positions_api_live"
 
     @staticmethod
     def _parse_order_execution(details: dict[str, Any] | None) -> tuple[str, float, float]:
@@ -660,6 +760,8 @@ class LiveTradingBot:
         if not trades:
             return
 
+        polled_trade_count = len(trades)
+
         trades = self._filter_startup_history_trades(trades, wallet_key)
         if not trades:
             return
@@ -685,6 +787,13 @@ class LiveTradingBot:
                     f"Count={count} trades in single poll | Trader={self._trader_label(wallet)}"
                 )
 
+        trades, aggregated_sell_count = self._aggregate_sell_signals_per_cycle(trades, wallet)
+        if aggregated_sell_count > 0:
+            logger.info(
+                f"Aggregated SELL signals in cycle: trader={self._trader_label(wallet)} | "
+                f"collapsed={aggregated_sell_count}"
+            )
+
         unavailable_markets_logged: set[str] = set()
 
         async def process_trade_with_reason(trade, wallet, unavailable_markets_logged, skipped_reasons):
@@ -706,10 +815,17 @@ class LiveTradingBot:
             logger_summary_parts.append(f"{count} {reason}")
 
         summary_str = " | ".join(logger_summary_parts)
+        processed_count = len(trades)
         if summary_str:
-            logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)} | {summary_str}")
+            logger.info(
+                f"Found {polled_trade_count} new trade(s) from {self._trader_label(wallet)} | "
+                f"processed={processed_count} | {summary_str}"
+            )
         else:
-            logger.info(f"Found {len(trades)} new trade(s) from {self._trader_label(wallet)}")
+            logger.info(
+                f"Found {polled_trade_count} new trade(s) from {self._trader_label(wallet)} | "
+                f"processed={processed_count}"
+            )
 
     async def _trade_poll_loop(self):
         """High-frequency tracked-account polling loop."""
@@ -1268,7 +1384,7 @@ class LiveTradingBot:
                 )
                 return
 
-            copied_current_shares = await self._get_copied_position_shares(
+            copied_current_shares, denominator_mode = await self._get_copied_position_shares(
                 incoming_trader,
                 market_slug,
                 normalized_outcome,
@@ -1291,10 +1407,24 @@ class LiveTradingBot:
                 return
 
             sell_ratio = copied_sell_shares / copied_denominator
-            sizing_reason = "positions_api_denominator"
+            sizing_reason = denominator_mode
 
             sell_ratio = max(0.0, min(1.0, sell_ratio))
             shares_to_sell = trader_local_shares * sell_ratio
+
+            near_full_threshold = max(0.5, min(1.0, Config.SELL_NEAR_FULL_RATIO_THRESHOLD))
+            if (
+                int(max(0.0, float(shares_to_sell))) <= 0
+                and sell_ratio >= near_full_threshold
+                and trader_local_shares >= 1.0
+            ):
+                shares_to_sell = trader_local_shares
+                sizing_reason = f"{sizing_reason}+near_full_integer_override"
+                logger.info(
+                    f"SELL near-full override applied: {market_slug} | {normalized_outcome} | "
+                    f"ratio={sell_ratio:.4f} >= {near_full_threshold:.2f}, "
+                    f"forcing full attributed liquidation={shares_to_sell:.2f}"
+                )
 
             logger.info(
                 f"SELL percent sizing: {market_slug} | {normalized_outcome} | "
