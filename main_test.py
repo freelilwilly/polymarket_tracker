@@ -78,6 +78,8 @@ class TestTradingBot:
         self._startup_bootstrap_pending_wallets: set[str] = set()
         self._selected_at_by_wallet_epoch: dict[str, float] = {}
         self._copied_position_shares_cache: dict[str, dict[str, Any]] = {}
+        self._sell_execution_locks: dict[str, asyncio.Lock] = {}
+        self._recent_sell_signal_at: dict[str, datetime] = {}
 
     def _is_us_market_temporarily_untradable(self, market_slug: str) -> bool:
         normalized_slug = self._normalize_market_slug(market_slug)
@@ -677,6 +679,9 @@ class TestTradingBot:
             return
 
         polled_trade_count = len(trades)
+        executed_trade_count = sum(
+            1 for trade in trades if self.trade_monitor.is_executed_trade_event(trade)
+        )
 
         trades = self._filter_startup_history_trades(trades, wallet_key)
         if not trades:
@@ -731,12 +736,12 @@ class TestTradingBot:
         summary_str = " | ".join(logger_summary_parts)
         if summary_str:
             logger.info(
-                f"Found {polled_trade_count} new trade(s) from {self._trader_label(wallet)} | "
+                f"Found {executed_trade_count} executed trade(s) from {self._trader_label(wallet)} | "
                 f"{summary_str}"
             )
         else:
             logger.info(
-                f"Found {polled_trade_count} new trade(s) from {self._trader_label(wallet)}"
+                f"Found {executed_trade_count} executed trade(s) from {self._trader_label(wallet)}"
             )
 
     async def _trade_poll_loop(self):
@@ -1295,69 +1300,102 @@ class TestTradingBot:
             )
             return
 
-        logger.info(
-            f"Processing SELL (SIM): {market_slug} | {outcome.upper()} | "
-            f"Trader: {self._trader_label(trader_wallet)} | {shares_to_sell:.2f} shares"
-        )
+        lock_key = f"{self._normalize_market_slug(market_slug)}|{normalized_outcome}"
+        sell_lock = self._sell_execution_locks.setdefault(lock_key, asyncio.Lock())
+        dedupe_key = f"{lock_key}|{incoming_trader}"
+        dedupe_window = max(1, int(Config.SELL_DEDUPE_WINDOW_SECONDS))
 
-        result = await self.trade_executor.execute_sell(
-            market_slug=market_slug,
-            shares=shares_to_sell,
-            outcome=normalized_outcome,
-            allow_full_liquidation_on_oversell=True,
-            treat_as_market=True,
-        )
+        async with sell_lock:
+            now = datetime.now(timezone.utc)
+            recent_at = self._recent_sell_signal_at.get(dedupe_key)
+            if isinstance(recent_at, datetime):
+                age_seconds = (now - recent_at).total_seconds()
+                if age_seconds < dedupe_window:
+                    logger.warning(
+                        f"Duplicate SELL detected within dedupe window, skipping: {market_slug} | "
+                        f"{normalized_outcome} | trader={self._trader_label(incoming_trader)} | "
+                        f"age={age_seconds:.2f}s < {dedupe_window}s"
+                    )
+                    return
+            self._recent_sell_signal_at[dedupe_key] = now
 
-        if result and result.get("skipped") and result.get("reason") == "IOC_UNFILLED":
-            logger.warning(
-                f"Copied SELL did not execute (IOC unfilled): {market_slug} | {normalized_outcome} | "
-                f"requested={shares_to_sell:.2f}"
-            )
-            return
-
-        if not (result and result.get("success")):
-            return
-
-        exit_price = to_float(result.get("price"), default=0.0)
-        sold_shares = to_float(result.get("shares"), default=shares_to_sell)
-
-        if sold_shares >= held_shares - 1e-9:
-            closed_position = self.position_manager.close_position(
-                market_slug=market_slug,
-                outcome=normalized_outcome,
-                exit_price=exit_price if exit_price > 0 else 0.0,
-                reason="trader_signal",
-            )
-
-            if closed_position:
-                pnl = closed_position.get("pnl", 0)
-                pnl_pct = closed_position.get("pnl_pct", 0)
-                logger.info(f"P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
-        else:
-            remaining_shares = max(0.0, held_shares - sold_shares)
-            self.position_manager.update_position_shares(
-                market_slug=market_slug,
-                outcome=normalized_outcome,
-                new_shares=remaining_shares,
-                trader_wallet=incoming_trader,
-            )
             logger.info(
-                f"Partial SELL applied: {market_slug} | {normalized_outcome} | "
-                f"sold={sold_shares:.2f}, remaining={remaining_shares:.2f}"
+                f"Processing SELL (SIM): {market_slug} | {outcome.upper()} | "
+                f"Trader: {self._trader_label(trader_wallet)} | {shares_to_sell:.2f} shares"
             )
-        
-        # Log to trackers even when partial.
-        self.excel_tracker.log_trade(
-            market_slug=market_slug,
-            outcome=normalized_outcome,
-            side="SELL",
-            shares=sold_shares if sold_shares > 0 else shares_to_sell,
-            price=exit_price if exit_price > 0 else 0.0,
-            trader=self._trader_label(trader_wallet),
-            status="executed",
-        )
-        if self.google_tracker:
-            self.google_tracker.log_trade(
+
+            result = await self.trade_executor.execute_sell(
+                market_slug=market_slug,
+                shares=shares_to_sell,
+                outcome=normalized_outcome,
+                allow_full_liquidation_on_oversell=True,
+                treat_as_market=True,
+            )
+
+            if result and result.get("skipped") and result.get("reason") == "IOC_UNFILLED":
+                logger.warning(
+                    f"Copied SELL did not execute (IOC unfilled): {market_slug} | {normalized_outcome} | "
+                    f"requested={shares_to_sell:.2f}"
+                )
+                return
+
+            if result and result.get("skipped") and result.get("reason") == "IOC_UNFILLED_OR_ALREADY_CLOSED":
+                close_epsilon = max(0.0, to_float(Config.SELL_CLOSE_EPSILON_SHARES, default=0.01))
+                live_remaining = await self.trade_executor._get_live_position_size(market_slug, normalized_outcome)
+                if live_remaining is not None and live_remaining <= close_epsilon:
+                    self.position_manager.close_position(
+                        market_slug=market_slug,
+                        outcome=normalized_outcome,
+                        exit_price=0.0,
+                        reason="trader_signal_reconciled",
+                    )
+                    logger.info(
+                        f"SELL reconciled as externally closed after uncertain IOC visibility (SIM): "
+                        f"{market_slug} | {normalized_outcome} | live_remaining={live_remaining:.4f}"
+                    )
+                else:
+                    logger.warning(
+                        f"SELL remained open after uncertain IOC visibility (SIM): {market_slug} | {normalized_outcome} | "
+                        f"live_remaining={(live_remaining if live_remaining is not None else 'UNKNOWN')}"
+                    )
+                return
+
+            if not (result and result.get("success")):
+                return
+
+            exit_price = to_float(result.get("price"), default=0.0)
+            sold_shares = to_float(result.get("shares"), default=shares_to_sell)
+            close_epsilon = max(0.0, to_float(Config.SELL_CLOSE_EPSILON_SHARES, default=0.01))
+            live_remaining = await self.trade_executor._get_live_position_size(market_slug, normalized_outcome)
+
+            if (live_remaining is not None and live_remaining <= close_epsilon) or sold_shares >= held_shares - 1e-9:
+                closed_position = self.position_manager.close_position(
+                    market_slug=market_slug,
+                    outcome=normalized_outcome,
+                    exit_price=exit_price if exit_price > 0 else 0.0,
+                    reason="trader_signal",
+                )
+
+                if closed_position:
+                    pnl = closed_position.get("pnl", 0)
+                    pnl_pct = closed_position.get("pnl_pct", 0)
+                    logger.info(f"P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
+            else:
+                remaining_shares = max(0.0, held_shares - sold_shares)
+                effective_remaining = min(remaining_shares, max(0.0, live_remaining)) if live_remaining is not None else remaining_shares
+                self.position_manager.update_position_shares(
+                    market_slug=market_slug,
+                    outcome=normalized_outcome,
+                    new_shares=effective_remaining,
+                    trader_wallet=incoming_trader,
+                )
+                logger.info(
+                    f"Partial SELL applied: {market_slug} | {normalized_outcome} | "
+                    f"sold={sold_shares:.2f}, remaining={effective_remaining:.2f}"
+                )
+
+            # Log to trackers even when partial.
+            self.excel_tracker.log_trade(
                 market_slug=market_slug,
                 outcome=normalized_outcome,
                 side="SELL",
@@ -1366,6 +1404,16 @@ class TestTradingBot:
                 trader=self._trader_label(trader_wallet),
                 status="executed",
             )
+            if self.google_tracker:
+                self.google_tracker.log_trade(
+                    market_slug=market_slug,
+                    outcome=normalized_outcome,
+                    side="SELL",
+                    shares=sold_shares if sold_shares > 0 else shares_to_sell,
+                    price=exit_price if exit_price > 0 else 0.0,
+                    trader=self._trader_label(trader_wallet),
+                    status="executed",
+                )
     
     async def _calculate_simulated_pnl(self, position: dict) -> dict[str, Any]:
         """

@@ -104,6 +104,36 @@ class TradeMonitor:
         if side_raw in ("S", "SELL", "SOLD"):
             return "SELL"
         return side_raw
+
+    @classmethod
+    def is_executed_trade_event(cls, trade: dict[str, Any]) -> bool:
+        """Heuristic filter for execution-like events from activity/trades feeds."""
+        if not isinstance(trade, dict):
+            return False
+
+        side = cls._normalize_side(trade.get("side") or trade.get("type"))
+        if side not in ("BUY", "SELL"):
+            return False
+
+        status_text = str(trade.get("status") or trade.get("state") or "").strip().lower()
+        if any(token in status_text for token in ("cancel", "reject", "fail", "expire", "open", "pending")):
+            return False
+
+        type_text = str(trade.get("type") or trade.get("activityType") or "").strip().lower()
+        if any(token in type_text for token in ("cancel", "reject", "fail", "order_open", "order_created")):
+            return False
+
+        size = trade.get("size") if trade.get("size") is not None else trade.get("amount")
+        try:
+            if float(size or 0) <= 0:
+                return False
+        except (TypeError, ValueError):
+            return False
+
+        # Execution records typically carry either transaction hash or stable row id.
+        tx_hash = str(trade.get("transactionHash") or trade.get("txHash") or "").strip()
+        row_id = trade.get("id")
+        return bool(tx_hash or row_id is not None)
     
     def initialize_wallet(self, wallet: str, historical_trades: list[dict[str, Any]]) -> None:
         """

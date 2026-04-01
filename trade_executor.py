@@ -572,6 +572,22 @@ class TradeExecutor:
             # Some venues/environments interpret short-side price basis differently.
             remaining = max(0.0, shares - total_filled)
             if normalized_outcome.lower() == "no" and total_filled <= 0 and remaining >= 1.0:
+                live_after_first = await self._get_live_position_size(market_slug, normalized_outcome)
+                close_epsilon = max(0.0, to_float(Config.SELL_CLOSE_EPSILON_SHARES, default=0.01))
+                if live_after_first is not None and live_after_first <= close_epsilon:
+                    logger.warning(
+                        f"IOC sell visibility uncertain but live position is near zero; skipping retry: "
+                        f"{market_slug} | live={live_after_first:.4f}"
+                    )
+                    return {
+                        "skipped": True,
+                        "reason": "IOC_UNFILLED_OR_ALREADY_CLOSED",
+                        "shares": 0.0,
+                        "price": price,
+                        "order_id": order_ids[0] if order_ids else None,
+                        "order_ids": order_ids,
+                        "live_remaining": live_after_first,
+                    }
                 logger.warning(
                     f"IOC sell unfilled on first attempt: {market_slug} | state={first_state or 'UNKNOWN'} | "
                     f"retrying with alternate NO-price basis"
@@ -589,6 +605,22 @@ class TradeExecutor:
                         weighted_notional += second_filled * (second_avg if second_avg > 0 else price)
 
             if total_filled <= 0:
+                live_after_attempts = await self._get_live_position_size(market_slug, normalized_outcome)
+                close_epsilon = max(0.0, to_float(Config.SELL_CLOSE_EPSILON_SHARES, default=0.01))
+                if live_after_attempts is not None and live_after_attempts <= close_epsilon:
+                    logger.warning(
+                        f"SELL IOC reported unfilled but live position is near zero: {market_slug} | "
+                        f"live={live_after_attempts:.4f} | order_ids={order_ids}"
+                    )
+                    return {
+                        "skipped": True,
+                        "reason": "IOC_UNFILLED_OR_ALREADY_CLOSED",
+                        "shares": 0.0,
+                        "price": price,
+                        "order_id": order_ids[0] if order_ids else None,
+                        "order_ids": order_ids,
+                        "live_remaining": live_after_attempts,
+                    }
                 logger.warning(
                     f"SELL IOC unfilled: {market_slug} | outcome={normalized_outcome} | "
                     f"requested={shares:.2f} | order_ids={order_ids}"

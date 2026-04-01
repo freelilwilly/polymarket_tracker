@@ -1027,6 +1027,8 @@ class PolymarketAPIClient:
                     "marketSlug": market_slug,
                     "outcome": outcome,
                     "size": long_size,
+                    "side": "LONG" if signed_size >= 0 else "SHORT",
+                    "signed_net_position": signed_size,
                     "raw": payload,
                 }
 
