@@ -844,8 +844,14 @@ class TestTradingBot:
             
             # Keep test mode behavior aligned with live-mode US constraints.
             if not is_sports_market(market_slug):
+                skip_hook = trade.get('_skip_reason_hook')
                 if not self._is_non_sports_market_cached(market_slug):
                     self._cache_non_sports_market(market_slug)
+                    if skip_hook is not None:
+                        skip_hook.append(f"{side_upper} non-sports market")
+                else:
+                    if skip_hook is not None:
+                        skip_hook.append(f"{side_upper} non-sports market (cached)")
                 return
 
             # Handle based on side

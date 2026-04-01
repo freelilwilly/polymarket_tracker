@@ -979,10 +979,10 @@ class LiveTradingBot:
                 if not self._is_non_sports_market_cached(market_slug):
                     self._cache_non_sports_market(market_slug)
                     if skip_hook is not None:
-                        skip_hook.append("BUY non-sports market")
+                        skip_hook.append(f"{side_upper} non-sports market")
                 else:
                     if skip_hook is not None:
-                        skip_hook.append("BUY non-sports market (cached)")
+                        skip_hook.append(f"{side_upper} non-sports market (cached)")
                 return
             
             # Handle based on side
