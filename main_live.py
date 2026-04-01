@@ -822,12 +822,12 @@ class LiveTradingBot:
         summary_str = " | ".join(logger_summary_parts)
         if summary_str:
             logger.info(
-                f"Found {executed_trade_count} executed trade(s) from {self._trader_label(wallet)} | "
+                f"Found {executed_trade_count} trade(s) from {self._trader_label(wallet)} | "
                 f"{summary_str}"
             )
         else:
             logger.info(
-                f"Found {executed_trade_count} executed trade(s) from {self._trader_label(wallet)}"
+                f"Found {executed_trade_count} trade(s) from {self._trader_label(wallet)}"
             )
 
     async def _trade_poll_loop(self):
