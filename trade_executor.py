@@ -176,9 +176,10 @@ class TradeExecutor:
                 }
             
             # Execute actual buy order (LIVE MODE) as market-style IOC only.
-            # Keep tolerance check above, then use aggressive limit + IOC so the
-            # order either fills immediately or cancels without resting on book.
-            ioc_price = 0.99
+            # Limit price respects tolerance to prevent fills far from observed price.
+            # For NO-side, the API inverts this (1.0 - ioc_price), so observed_price + tolerance
+            # translates to a NO-side limit that prevents egregious fills.
+            ioc_price = min(0.99, observed_price + self.max_price_tolerance)
 
             async def _fetch_buy_execution(order_id_value: str) -> dict[str, Any]:
                 """Poll order details with short backoff and return buy execution summary."""
