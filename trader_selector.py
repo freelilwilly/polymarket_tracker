@@ -20,7 +20,7 @@ class TraderSelector:
         self.api_client = api_client
 
     async def _get_required_tag_candidates(self, max_rank: int) -> list[dict[str, Any]]:
-        """Get tagged analytics candidates constrained to global rank threshold."""
+        """Get tagged analytics candidates constrained to ACTUAL global rank threshold."""
         required_tags = [
             t.strip() for t in (Config.REQUIRED_TRADER_TAGS or "").split(",") if t.strip()
         ]
@@ -28,42 +28,86 @@ class TraderSelector:
             return []
 
         rank_cap = max(1, int(max_rank))
-        fetch_limit = max(1000, rank_cap * 4)
+        fetch_limit = max(2000, rank_cap * 4)
 
-        # Fetch a broad tagged snapshot and keep only global top-N by rank.
-        # Retry because analytics can intermittently return empty data for valid tag queries.
+        # CRITICAL: When tag filters are applied, the API returns rank WITHIN that tag group,
+        # not global rank. To get actual global top-N with tags, we need to:
+        # 1. Fetch global top-N traders (no tag filter)
+        # 2. Cross-reference with tagged traders to check if they have required tags
+        
         retry_delays = [0.0, 0.5, 1.0]
+        
+        global_traders = None
+        tagged_traders_map = None
+        
         for attempt, delay_seconds in enumerate(retry_delays, start=1):
             if delay_seconds > 0:
                 await asyncio.sleep(delay_seconds)
 
-            tagged_rows = await self.api_client.get_traders_performance(
-                limit=fetch_limit,
-                apply_required_tags=True,
-            )
-
-            candidates: list[dict[str, Any]] = []
-            for row in tagged_rows:
-                if not isinstance(row, dict):
+            # Fetch global top-N traders (unfiltered)
+            if global_traders is None:
+                global_traders = await self.api_client.get_traders_performance(
+                    limit=fetch_limit,
+                    apply_required_tags=False,
+                )
+                if not global_traders:
+                    logger.warning(f"Global trader fetch returned empty on attempt {attempt}")
                     continue
-                wallet = str(row.get("wallet") or row.get("address") or "").strip().lower()
+
+            # Fetch tagged traders to check tag membership
+            if tagged_traders_map is None:
+                tagged_rows = await self.api_client.get_traders_performance(
+                    limit=fetch_limit,
+                    apply_required_tags=True,
+                )
+                if not tagged_rows:
+                    logger.warning(f"Tagged trader fetch returned empty on attempt {attempt}")
+                    continue
+                    
+                # Build wallet -> trader map for tagged traders
+                tagged_traders_map = {}
+                for row in tagged_rows:
+                    if isinstance(row, dict):
+                        wallet = str(row.get("wallet") or row.get("address") or "").strip().lower()
+                        if wallet:
+                            tagged_traders_map[wallet] = row
+
+            # Cross-reference: keep only global top-N traders who have required tags
+            candidates: list[dict[str, Any]] = []
+            for trader in global_traders:
+                if not isinstance(trader, dict):
+                    continue
+                    
+                wallet = str(trader.get("wallet") or trader.get("address") or "").strip().lower()
                 if not wallet:
                     continue
 
-                rank = int(to_float(row.get("rank"), default=0.0))
-                if rank > 0 and rank <= rank_cap:
-                    candidates.append(row)
+                # Get GLOBAL rank from unfiltered API response
+                global_rank = int(to_float(trader.get("rank"), default=0.0))
+                if global_rank <= 0 or global_rank > rank_cap:
+                    continue
+                
+                # Check if this trader has the required tags
+                if wallet not in tagged_traders_map:
+                    continue
+                
+                # Use trader data from global fetch (has correct global rank)
+                # but verify they have required tags via tagged_traders_map presence
+                display_name = trader.get("display_name") or wallet[:8]
+                logger.debug(
+                    f"Including trader {display_name} | global_rank={global_rank} | has required tags"
+                )
+                candidates.append(trader)
 
             if candidates:
                 logger.info(
-                    f"Loaded {len(candidates)} tagged candidates within global top {rank_cap} "
+                    f"Loaded {len(candidates)} traders with required tags within global top {rank_cap} "
                     f"(attempt {attempt}/{len(retry_delays)})"
                 )
                 return candidates
 
             logger.warning(
-                f"Tagged global-top candidate lookup returned 0 rows on attempt "
-                f"{attempt}/{len(retry_delays)}"
+                f"Cross-reference returned 0 qualified traders on attempt {attempt}/{len(retry_delays)}"
             )
 
         return []
