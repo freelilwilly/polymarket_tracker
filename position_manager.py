@@ -47,10 +47,20 @@ class PositionManager:
 
     def _canonical_market_slug(self, market_slug: str) -> str:
         slug = str(market_slug or "").strip().lower()
+        
+        # First normalize slug value (strip aec- prefix, etc.)
         normalizer = getattr(self.api_client, "_normalize_slug_value", None)
         if callable(normalizer):
-            return str(normalizer(slug) or "").strip().lower()
-        return slug[4:] if slug.startswith("aec-") else slug
+            slug = str(normalizer(slug) or "").strip().lower()
+        else:
+            slug = slug[4:] if slug.startswith("aec-") else slug
+        
+        # Apply team abbreviation mapping to handle variations like "sas" → "sa"
+        abbrev_mapper = getattr(self.api_client, "_apply_team_abbreviation_map", None)
+        if callable(abbrev_mapper):
+            slug = abbrev_mapper(slug)
+        
+        return str(slug or "").strip().lower()
 
     @staticmethod
     def _normalize_trader_shares(raw: Any) -> dict[str, float]:
