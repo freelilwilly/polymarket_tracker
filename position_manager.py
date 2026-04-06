@@ -514,8 +514,11 @@ class PositionManager:
             Total invested amount
         """
         total = 0.0
+        # Normalize both slugs for comparison to handle abbreviation variations (e.g., "sa" vs "sas")
+        normalized_market = self._canonical_market_slug(market_slug)
         for key, pos in self.positions.items():
-            if pos["market_slug"] == market_slug:
+            pos_market = self._canonical_market_slug(pos["market_slug"])
+            if pos_market == normalized_market:
                 total += pos.get("invested", 0.0)
         
         return total
