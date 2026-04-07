@@ -16,8 +16,10 @@ from liquidation_manager import LiquidationManager
 from position_manager import PositionManager
 from slug_converter import SlugConverter
 from sports_filter import is_sports_market
+from stop_loss_manager import StopLossManager
 from trade_executor import TradeExecutor
 from trade_monitor import TradeMonitor
+from trader_position_monitor import TraderPositionMonitor
 from trader_selector import TraderSelector
 from utils import calculate_multiplier, calculate_percentile, median, to_float
 
@@ -47,11 +49,16 @@ class LiveTradingBot:
         self.slug_converter = SlugConverter()
         self.trader_selector = TraderSelector(self.api_client)
         self.trade_monitor = TradeMonitor(self.api_client, self.slug_converter)
+        self.trader_position_monitor = TraderPositionMonitor(self.api_client)
         self.trade_executor = TradeExecutor(
             self.api_client,
             test_mode=False,
         )
         self.liquidation_manager = LiquidationManager(
+            self.api_client,
+            self.position_manager,
+        )
+        self.stop_loss_manager = StopLossManager(
             self.api_client,
             self.position_manager,
         )
@@ -379,9 +386,22 @@ class LiveTradingBot:
 
         incoming: list[dict[str, Any]] = []
         for trade in trades:
-            trade_epoch = self._trade_timestamp_epoch(trade)
-            if trade_epoch > selected_at_epoch:
+            # Extract trade side
+            side_raw = str(trade.get("side") or trade.get("type") or "").strip().upper()
+            is_sell = side_raw in ("S", "SELL", "SOLD")
+            
+            # Always include SELLs (ownership validation in _handle_sell_signal prevents unwanted execution)
+            # Only filter BUYs by timestamp to prevent copying historical positions
+            if is_sell:
                 incoming.append(trade)
+                logger.debug(
+                    f"Bootstrap filter: Including SELL from {self._trader_label(wallet_key)} "
+                    f"(bypassing timestamp filter for position closure)"
+                )
+            else:
+                trade_epoch = self._trade_timestamp_epoch(trade)
+                if trade_epoch > selected_at_epoch:
+                    incoming.append(trade)
 
         if incoming:
             self._startup_bootstrap_pending_wallets.discard(wallet_key)
@@ -654,6 +674,7 @@ class LiveTradingBot:
             if wallet_key and display_name:
                 self._trader_display_names[wallet_key] = display_name
                 self.trade_monitor.set_wallet_label(wallet_key, display_name)
+                self.trader_position_monitor.set_wallet_label(wallet_key, display_name)
 
             logger.info(
                 f"Selected trader {index}: {self._trader_label(wallet)} | wallet={wallet_key}"
@@ -661,6 +682,7 @@ class LiveTradingBot:
 
             historical = await self.api_client.get_user_trades(wallet=wallet, limit=Config.TRADE_PAGE_SIZE)
             self.trade_monitor.initialize_wallet(wallet, historical)
+            self.trader_position_monitor.initialize_wallet(wallet)
 
         logger.info(f"Monitoring {len(self.selected_traders)} traders")
     
@@ -697,7 +719,7 @@ class LiveTradingBot:
             return
         
         # Sync positions with API
-        await self.position_manager.sync_positions_with_api()
+        _ = await self.position_manager.sync_positions_with_api()
 
         # Use the same equity calculation as the recurring account-status log
         # so startup values are consistent (cash + live position value).
@@ -743,11 +765,17 @@ class LiveTradingBot:
         
         # Start loops
         self.running = True
-        await asyncio.gather(
+        loops = [
             self._trade_poll_loop(),
             self._maintenance_loop(),
             self._account_status_log_loop(),
-        )
+        ]
+        
+        if Config.TRADER_POSITION_MONITORING_ENABLED:
+            loops.append(self._trader_position_monitor_loop())
+            logger.info("Trader position monitoring: ENABLED")
+        
+        await asyncio.gather(*loops)
     
     async def _poll_single_trader(self, trader: dict, semaphore: asyncio.Semaphore):
         """Poll one tracked trader and process any new trades immediately."""
@@ -867,10 +895,55 @@ class LiveTradingBot:
         while self.running:
             try:
                 await self._reconcile_pending_buys()
-                await self.position_manager.sync_positions_with_api()
+                emergency_sell_candidates = await self.position_manager.sync_positions_with_api()
+
+                # Execute emergency sells for positions detected as externally closed
+                if emergency_sell_candidates:
+                    for candidate in emergency_sell_candidates:
+                        market_slug = candidate.get("market_slug")
+                        outcome = candidate.get("outcome")
+                        shares = candidate.get("shares", 0.0)
+                        monitored_trader = candidate.get("monitored_trader", "unknown")
+                        reason = candidate.get("reason", "unknown")
+                        
+                        logger.warning(
+                            f"EMERGENCY SELL triggered: {market_slug} | {outcome} | "
+                            f"{shares:.2f} shares | trader={monitored_trader} | reason={reason}"
+                        )
+                        
+                        try:
+                            result = await self.trade_executor.execute_sell(
+                                market_slug=market_slug,
+                                shares=shares,
+                                outcome=outcome,
+                                allow_full_liquidation_on_oversell=True,
+                                treat_as_market=True,
+                            )
+                            
+                            if result and not result.get("skipped"):
+                                logger.info(
+                                    f"EMERGENCY SELL executed: {market_slug} | {outcome} | "
+                                    f"{shares:.2f} shares | order_ids={result.get('order_ids', [])}"
+                                )
+                            elif result and result.get("skipped"):
+                                logger.warning(
+                                    f"EMERGENCY SELL skipped: {market_slug} | {outcome} | "
+                                    f"reason={result.get('reason', 'unknown')}"
+                                )
+                            else:
+                                logger.error(
+                                    f"EMERGENCY SELL failed: {market_slug} | {outcome}"
+                                )
+                        except Exception as e:
+                            logger.exception(
+                                f"Error executing emergency sell for {market_slug} | {outcome}: {e}"
+                            )
 
                 if Config.ENABLE_AUTO_LIQUIDATION:
                     await self.liquidation_manager.manage_liquidation_orders()
+
+                if Config.ENABLE_STOP_LOSS:
+                    await self.stop_loss_manager.manage_stop_loss_orders()
 
                 balance = await self.position_manager.update_balance()
                 if balance is not None:
@@ -915,7 +988,7 @@ class LiveTradingBot:
                 if balance is not None:
                     # CRITICAL: Sync with API first to ensure accurate position count
                     # This prevents showing stale cached position data in account status
-                    await self.position_manager.sync_positions_with_api()
+                    _ = await self.position_manager.sync_positions_with_api()
                     
                     summary = self.position_manager.get_summary()
                     cash = summary.get("buying_power")
@@ -940,6 +1013,85 @@ class LiveTradingBot:
             elapsed = asyncio.get_running_loop().time() - loop_started
             sleep_for = max(0.0, 60.0 - elapsed)
             await asyncio.sleep(sleep_for)
+    
+    async def _trader_position_monitor_loop(self):
+        """Monitor trader positions to detect exits via GTC limit orders."""
+        logger.info("Starting trader position monitoring loop")
+        
+        while self.running:
+            loop_started = asyncio.get_running_loop().time()
+            try:
+                if not self.selected_traders:
+                    await asyncio.sleep(max(1, Config.SCAN_INTERVAL_SECONDS))
+                    continue
+                
+                # Poll each trader's positions
+                for trader in self.selected_traders:
+                    wallet = trader.get("wallet")
+                    if not wallet:
+                        continue
+                    
+                    try:
+                        # Detect position exits
+                        exits = await self.trader_position_monitor.poll_trader_positions(wallet)
+                        
+                        # Process each detected exit as a SELL signal
+                        for exit_event in exits:
+                            await self._handle_trader_position_exit(exit_event)
+                    
+                    except Exception as e:
+                        logger.exception(
+                            f"Error monitoring positions for {self._trader_label(wallet)}: {e}"
+                        )
+            
+            except Exception as e:
+                logger.exception(f"Error in trader position monitor loop: {e}")
+            
+            # Run at same interval as maintenance loop
+            elapsed = asyncio.get_running_loop().time() - loop_started
+            sleep_for = max(0.0, float(Config.SCAN_INTERVAL_SECONDS) - elapsed)
+            await asyncio.sleep(sleep_for)
+    
+    async def _handle_trader_position_exit(self, exit_event: dict[str, Any]):
+        """
+        Handle detected trader position exit.
+        
+        This generates a synthetic SELL signal for positions closed via
+        GTC limit orders that don't appear in trade activity feeds.
+        """
+        market_slug = exit_event.get("market_slug")
+        outcome = exit_event.get("outcome")
+        trader_wallet = exit_event.get("trader_wallet")
+        trader_label = exit_event.get("trader_label", "UNKNOWN")
+        reduction_ratio = exit_event.get("reduction_ratio", 0.0)
+        
+        if not market_slug or not outcome or not trader_wallet:
+            return
+        
+        logger.info(
+            f"Processing trader exit: {market_slug} | {outcome.upper()} | "
+            f"Trader: {trader_label} | {reduction_ratio*100:.1f}% reduction"
+        )
+        
+        # Create synthetic SELL signal
+        synthetic_sell = {
+            "market_slug": market_slug,
+            "outcome": outcome,
+            "side": "SELL",
+            "price": 0.50,  # Price doesn't matter for full exits
+            "size": 0,  # Trust position sync for sizing
+            "_synthetic_exit": True,  # Mark as synthetic
+            "_exit_ratio": reduction_ratio,
+        }
+        
+        unavailable_markets: set[str] = set()
+        
+        # Process as regular SELL signal
+        await self._handle_sell_signal(
+            synthetic_sell,
+            trader_wallet,
+            unavailable_markets,
+        )
     
     async def _process_trade(
         self,
@@ -1132,6 +1284,20 @@ class LiveTradingBot:
             skip_hook = trade.get('_skip_reason_hook')
             if skip_hook is not None:
                 skip_hook.append("BUY outside range")
+            return
+
+        # Check wash sale blocking
+        is_blocked, block_reason = self.position_manager.is_buy_blocked_by_wash_sale(
+            market_slug, normalized_outcome
+        )
+        if is_blocked:
+            logger.warning(
+                f"Wash sale block: {market_slug} | {normalized_outcome} | "
+                f"Trader: {self._trader_label(trader_wallet)} | {block_reason}"
+            )
+            skip_hook = trade.get('_skip_reason_hook')
+            if skip_hook is not None:
+                skip_hook.append("wash sale blocked")
             return
 
         can_open, reason = self.position_manager.can_open_position(market_slug, investment_amount)
@@ -1478,6 +1644,10 @@ class LiveTradingBot:
             if Config.ENABLE_AUTO_LIQUIDATION:
                 await self.liquidation_manager.cancel_liquidation_order(market_slug, normalized_outcome)
 
+            # Cancel stop-loss order if exists
+            if Config.ENABLE_STOP_LOSS:
+                await self.stop_loss_manager.cancel_stop_loss_order(market_slug, normalized_outcome)
+
             logger.info(
                 f"Processing SELL: {market_slug} | {outcome.upper()} | "
                 f"Trader: {self._trader_label(trader_wallet)} | {shares_to_sell:.2f} shares"
@@ -1639,6 +1809,10 @@ class LiveTradingBot:
         # Cancel all liquidation orders
         if Config.ENABLE_AUTO_LIQUIDATION:
             await self.liquidation_manager.cancel_all_liquidation_orders()
+        
+        # Cancel all stop-loss orders
+        if Config.ENABLE_STOP_LOSS:
+            await self.stop_loss_manager.cancel_all_stop_loss_orders()
         
         # Save slug converter mappings
         self.slug_converter.save_mappings()

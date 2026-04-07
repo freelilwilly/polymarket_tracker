@@ -345,9 +345,22 @@ class TestTradingBot:
 
         incoming: list[dict[str, Any]] = []
         for trade in trades:
-            trade_epoch = self._trade_timestamp_epoch(trade)
-            if trade_epoch > selected_at_epoch:
+            # Extract trade side
+            side_raw = str(trade.get("side") or trade.get("type") or "").strip().upper()
+            is_sell = side_raw in ("S", "SELL", "SOLD")
+            
+            # Always include SELLs (ownership validation in _handle_sell_signal prevents unwanted execution)
+            # Only filter BUYs by timestamp to prevent copying historical positions
+            if is_sell:
                 incoming.append(trade)
+                logger.debug(
+                    f"Bootstrap filter: Including SELL from {self._trader_label(wallet_key)} "
+                    f"(bypassing timestamp filter for position closure)"
+                )
+            else:
+                trade_epoch = self._trade_timestamp_epoch(trade)
+                if trade_epoch > selected_at_epoch:
+                    incoming.append(trade)
 
         if incoming:
             self._startup_bootstrap_pending_wallets.discard(wallet_key)

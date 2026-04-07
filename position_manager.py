@@ -17,6 +17,7 @@ from typing import Any, Optional
 from api_client import PolymarketAPIClient
 from config import Config
 from utils import to_float
+from wash_sale_tracker import WashSaleTracker
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,14 @@ class PositionManager:
         self.buying_power: Optional[float] = None
         self._recent_owner_cache: dict[str, dict[str, Any]] = {}
         self._sync_missing_counts: dict[str, int] = {}
+        
+        # Initialize wash sale tracker
+        wash_sale_file = (
+            "wash_sale_state.json" if not configured_state_file or configured_state_file == "positions_state.json"
+            else f"wash_sale_{configured_state_file}"
+        )
+        self.wash_sale_tracker = WashSaleTracker(state_file=wash_sale_file) if Config.ENABLE_WASH_SALE_PREVENTION else None
+        
         self._load_state()
 
     def _position_identity(self, market_slug: str, outcome: str) -> str:
@@ -700,6 +709,15 @@ class PositionManager:
         
         self._save_state()
         
+        # Record wash sale if this was a loss
+        if Config.ENABLE_WASH_SALE_PREVENTION and self.wash_sale_tracker and pnl < 0:
+            self.wash_sale_tracker.record_loss_sale(
+                market_slug=market_slug,
+                outcome=outcome,
+                realized_pnl=pnl,
+                exit_price=exit_price,
+            )
+        
         logger.info(
             f"Closed position: {market_slug} | {outcome} | "
             f"P&L=${pnl:+.2f} ({pnl_pct:+.2f}%) | Reason: {reason}"
@@ -796,19 +814,45 @@ class PositionManager:
         trader_shares = self._ensure_position_trader_shares(position)
         return max(0.0, to_float(trader_shares.get(owner), default=0.0))
     
-    async def sync_positions_with_api(self):
+    def is_buy_blocked_by_wash_sale(self, market_slug: str, outcome: str) -> tuple[bool, Optional[str]]:
+        """
+        Check if buy is blocked by wash sale rule.
+        
+        Args:
+            market_slug: Market identifier
+            outcome: Position outcome (yes/no)
+            
+        Returns:
+            Tuple of (is_blocked, reason_if_blocked)
+        """
+        if not Config.ENABLE_WASH_SALE_PREVENTION or not self.wash_sale_tracker:
+            return (False, None)
+        
+        is_blocked = self.wash_sale_tracker.is_blocked(market_slug, outcome)
+        if not is_blocked:
+            return (False, None)
+        
+        reason = self.wash_sale_tracker.get_blocked_reason(market_slug, outcome)
+        return (True, reason)
+    
+    async def sync_positions_with_api(self) -> list[dict[str, Any]]:
         """
         Synchronize local positions with API positions.
         
         Handles:
         - Positions closed externally
         - Position size mismatches
+        
+        Returns:
+            List of positions requiring emergency sell (detected as externally closed)
         """
+        emergency_sell_candidates: list[dict[str, Any]] = []
+        
         api_positions = await self.api_client.get_positions()
         
         if api_positions is None:
             logger.warning("Cannot sync positions: API returned None")
-            return
+            return emergency_sell_candidates
         
         # Build lookup from API positions
         # Map API positions by their NORMALIZED keys only for importing
@@ -958,6 +1002,17 @@ class PositionManager:
                     f"Position closed externally after repeated fallback match misses: {local_market} | {local_outcome} | "
                     f"misses={misses}"
                 )
+                
+                # Add to emergency sell candidates if feature is enabled
+                if Config.EMERGENCY_SELL_ON_EXTERNAL_CLOSE_ENABLED:
+                    emergency_sell_candidates.append({
+                        "market_slug": local_market,
+                        "outcome": local_outcome,
+                        "shares": to_float(local_pos.get("shares"), default=0.0),
+                        "monitored_trader": local_pos.get("monitored_trader"),
+                        "reason": "external_close_detected",
+                    })
+                
                 to_remove.append(key)
             else:
                 self._sync_missing_counts.pop(miss_identity, None)
@@ -1187,6 +1242,8 @@ class PositionManager:
                         f"Exposure=${pos_info['exposure']:.2f} | Cap=${pos_info['cap']:.2f} | "
                         f"Over by ${pos_info['excess']:.2f} ({pos_info['excess']/pos_info['cap']*100:.1f}%)"
                     )
+        
+        return emergency_sell_candidates
     
     def get_all_positions(self) -> list[dict[str, Any]]:
         """

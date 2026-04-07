@@ -69,8 +69,24 @@ class Config:
 
     # Owner-link recovery and copied SELL policy
     POSITION_OWNER_RECOVERY_TTL_SECONDS: int = int(os.getenv("POSITION_OWNER_RECOVERY_TTL_SECONDS", "600"))
-    POSITION_SYNC_MISS_THRESHOLD: int = int(os.getenv("POSITION_SYNC_MISS_THRESHOLD", "3"))
+    POSITION_SYNC_MISS_THRESHOLD: int = int(os.getenv("POSITION_SYNC_MISS_THRESHOLD", "1"))  # Reduced from 3 to 1 for faster detection
     SELL_OWNER_CONDITIONAL_ALLOW_ENABLED: bool = os.getenv("SELL_OWNER_CONDITIONAL_ALLOW_ENABLED", "true").lower() in ("true", "1", "yes")
+    
+    # Trader position monitoring (detects GTC limit order exits)
+    TRADER_POSITION_MONITORING_ENABLED: bool = os.getenv("TRADER_POSITION_MONITORING_ENABLED", "true").lower() in ("true", "1", "yes")
+    TRADER_POSITION_EXIT_THRESHOLD: float = float(os.getenv("TRADER_POSITION_EXIT_THRESHOLD", "0.80"))  # 80% reduction triggers exit signal
+    
+    # Emergency sell on external position closure
+    EMERGENCY_SELL_ON_EXTERNAL_CLOSE_ENABLED: bool = os.getenv("EMERGENCY_SELL_ON_EXTERNAL_CLOSE_ENABLED", "true").lower() in ("true", "1", "yes")
+
+    # Wash Sale Prevention (30-day blocking after realized loss)
+    ENABLE_WASH_SALE_PREVENTION: bool = os.getenv("ENABLE_WASH_SALE_PREVENTION", "true").lower() in ("true", "1", "yes")
+    WASH_SALE_DAYS: int = int(os.getenv("WASH_SALE_DAYS", "30"))  # Traditional IRS wash sale period
+    
+    # Stop-Loss Protection (limit sell at % below entry price)
+    ENABLE_STOP_LOSS: bool = os.getenv("ENABLE_STOP_LOSS", "true").lower() in ("true", "1", "yes")
+    STOP_LOSS_PERCENT: float = float(os.getenv("STOP_LOSS_PERCENT", "0.15"))  # 15% below entry = 0.15
+    STOP_LOSS_PRICE_TOLERANCE: float = float(os.getenv("STOP_LOSS_PRICE_TOLERANCE", "0.05"))  # 5% tolerance for API order adoption
 
     # Copied SELL sizing behavior
     SELL_PERCENT_SIZING_ENABLED: bool = os.getenv("SELL_PERCENT_SIZING_ENABLED", "true").lower() in ("true", "1", "yes")
