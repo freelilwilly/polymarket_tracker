@@ -1068,9 +1068,22 @@ class LiveTradingBot:
         if not market_slug or not outcome or not trader_wallet:
             return
         
-        logger.info(
-            f"Processing trader exit: {market_slug} | {outcome.upper()} | "
-            f"Trader: {trader_label} | {reduction_ratio*100:.1f}% reduction"
+        # Only process if we have attributed shares from this trader
+        attributed_shares = self.position_manager.get_trader_attributed_shares(
+            market_slug, outcome, trader_wallet
+        )
+        
+        if attributed_shares <= 0:
+            logger.debug(
+                f"Skipping trader exit (no attributed shares): {market_slug} | {outcome.upper()} | "
+                f"Trader: {trader_label}"
+            )
+            return
+        
+        logger.warning(
+            f"TRADER EXIT DETECTED (we have position): {market_slug} | {outcome.upper()} | "
+            f"Trader: {trader_label} | {reduction_ratio*100:.1f}% reduction | "
+            f"Our shares from trader: {attributed_shares:.2f}"
         )
         
         # Create synthetic SELL signal
@@ -1084,13 +1097,13 @@ class LiveTradingBot:
             "_exit_ratio": reduction_ratio,
         }
         
-        unavailable_markets: set[str] = set()
-        
         # Process as regular SELL signal
         await self._handle_sell_signal(
-            synthetic_sell,
-            trader_wallet,
-            unavailable_markets,
+            market_slug=market_slug,
+            outcome=outcome,
+            trader_wallet=trader_wallet,
+            trade=synthetic_sell,
+            observed_size=None,
         )
     
     async def _process_trade(
@@ -1624,7 +1637,12 @@ class LiveTradingBot:
         lock_key = f"{self._normalize_market_slug(market_slug)}|{normalized_outcome}"
         sell_lock = self._sell_execution_locks.setdefault(lock_key, asyncio.Lock())
         dedupe_key = f"{lock_key}|{incoming_trader}"
-        dedupe_window = max(1, int(Config.SELL_DEDUPE_WINDOW_SECONDS))
+        
+        # Use different dedupe windows based on sell source:
+        # - Synthetic (position monitor): 60s to prevent duplicate detection after observed sell
+        # - Observed (activity feed): 5s to only catch true duplicates, allow rapid legitimate sells
+        is_synthetic = trade and trade.get("_synthetic_exit", False)
+        dedupe_window = 60 if is_synthetic else 5
 
         async with sell_lock:
             now = datetime.now(timezone.utc)
@@ -1632,10 +1650,11 @@ class LiveTradingBot:
             if isinstance(recent_at, datetime):
                 age_seconds = (now - recent_at).total_seconds()
                 if age_seconds < dedupe_window:
+                    source = "synthetic" if is_synthetic else "observed"
                     logger.warning(
                         f"Duplicate SELL detected within dedupe window, skipping: {market_slug} | "
                         f"{normalized_outcome} | trader={self._trader_label(incoming_trader)} | "
-                        f"age={age_seconds:.2f}s < {dedupe_window}s"
+                        f"age={age_seconds:.2f}s < {dedupe_window}s | source={source}"
                     )
                     return
             self._recent_sell_signal_at[dedupe_key] = now

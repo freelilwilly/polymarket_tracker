@@ -118,8 +118,8 @@ class TraderPositionMonitor:
                     if reduction_ratio >= Config.TRADER_POSITION_EXIT_THRESHOLD:
                         market_slug, outcome = position_key.split("|", 1)
                         
-                        logger.warning(
-                            f"TRADER EXIT DETECTED: {self._wallet_label(wallet)} | "
+                        logger.debug(
+                            f"Trader exit detected: {self._wallet_label(wallet)} | "
                             f"{market_slug} | {outcome} | "
                             f"shares: {prev_shares:.2f} -> {current_shares:.2f} "
                             f"({reduction_ratio*100:.1f}% reduction)"

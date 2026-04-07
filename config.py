@@ -93,7 +93,7 @@ class Config:
     SELL_PERCENT_FALLBACK_MAX_RATIO: float = float(os.getenv("SELL_PERCENT_FALLBACK_MAX_RATIO", "0.50"))
     SELL_NEAR_FULL_RATIO_THRESHOLD: float = float(os.getenv("SELL_NEAR_FULL_RATIO_THRESHOLD", "0.95"))
     COPIED_POSITIONS_CACHE_TTL_SECONDS: int = int(os.getenv("COPIED_POSITIONS_CACHE_TTL_SECONDS", "120"))
-    SELL_DEDUPE_WINDOW_SECONDS: int = int(os.getenv("SELL_DEDUPE_WINDOW_SECONDS", "5"))
+    SELL_DEDUPE_WINDOW_SECONDS: int = int(os.getenv("SELL_DEDUPE_WINDOW_SECONDS", "5"))  # Unused: differential windows now hardcoded (5s observed, 60s synthetic)
     SELL_CLOSE_EPSILON_SHARES: float = float(os.getenv("SELL_CLOSE_EPSILON_SHARES", "0.01"))
     
     # Size Normalization (percentile-based multiplier logic from polymarket_tracker)
