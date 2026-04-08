@@ -51,6 +51,9 @@ copytrade.log
 # Runtime state files (copytrade bot)
 positions_state.json
 learned_slug_mappings.json
+stop_loss_state.json
+wash_sale_state.json
+*_state.json
 *.xlsx
 *.xlsx.tmp
 test_performance.xlsx
