@@ -912,6 +912,48 @@ class PolymarketAPIClient:
         logger.warning(f"No valid prices in order book for {market_slug}")
         return None
     
+    async def get_best_price_by_token_id(self, token_id: str, side: str) -> Optional[float]:
+        """
+        Get best price from order book using token_id directly (bypasses market metadata).
+        
+        Args:
+            token_id: Token ID to query orderbook for
+            side: "buy" or "sell"
+            
+        Returns:
+            Best price as float or None
+        """
+        # Get order book from CLOB API
+        url = f"{self.clob_api_base}/book"
+        params = {"token_id": token_id}
+        data = await self._get_json(url, params=params)
+        
+        if not isinstance(data, dict):
+            logger.warning(f"No order book data for token_id={token_id}")
+            return None
+        
+        # Extract best price from order book
+        try:
+            side_lower = side.lower()
+            if side_lower == "buy":
+                asks = data.get("asks", [])
+                if asks and isinstance(asks, list):
+                    prices = [float(ask.get("price", 0)) for ask in asks if ask.get("price")]
+                    if prices:
+                        return min(prices)
+            else:
+                bids = data.get("bids", [])
+                if bids and isinstance(bids, list):
+                    prices = [float(bid.get("price", 0)) for bid in bids if bid.get("price")]
+                    if prices:
+                        return max(prices)
+        except Exception as e:
+            logger.warning(f"Error extracting price from orderbook for token_id={token_id}: {e}")
+            return None
+        
+        logger.warning(f"No valid prices in order book for token_id={token_id}")
+        return None
+    
     # ==================== US Trading API Methods (Authentication Required) ====================
 
     async def get_account_overview(self) -> Optional[dict[str, float]]:

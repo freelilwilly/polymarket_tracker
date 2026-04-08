@@ -189,10 +189,29 @@ class StopLossManager:
                                 api_outcome = str(api_pos.get("outcome") or "").strip().lower()
                                 if api_outcome in ("yes", "no"):
                                     normalized_outcome = api_outcome
+                                    
+                                    # Extract token_id from raw position data for orderbook lookup
+                                    raw_data = api_pos.get("raw") or {}
+                                    token_id = (
+                                        raw_data.get("tokenId") or 
+                                        raw_data.get("token_id") or
+                                        raw_data.get("assetId") or
+                                        raw_data.get("asset_id")
+                                    )
+                                    
+                                    if token_id:
+                                        # Store token_id for price lookup (bypass market metadata)
+                                        self.stop_loss_thresholds.setdefault(
+                                            self.position_manager.get_position_key(market_slug, api_outcome),
+                                            {}
+                                        )["token_id"] = str(token_id)
+                                    
                                     logger.info(
                                         f"Inferred outcome from API position: {market_slug} | "
-                                        f"{outcome} -> {api_outcome}"
+                                        f"{outcome} -> {api_outcome}" +
+                                        (f" | token_id={token_id}" if token_id else "")
                                     )
+                                    
                                     # Reconcile for future use
                                     self.position_manager.reconcile_outcome_alias(
                                         market_slug=market_slug,
@@ -234,12 +253,20 @@ class StopLossManager:
             
             if not existing_threshold:
                 # New position, set up stop-loss threshold
-                self.stop_loss_thresholds[position_key] = {
+                # Preserve token_id if it was set during fallback
+                new_threshold = {
                     "stop_price": stop_price,
                     "entry_price": entry_price,
                     "shares": shares,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
+                
+                # Check if token_id was already stored (from fallback)
+                temp_threshold = self.stop_loss_thresholds.get(position_key, {})
+                if "token_id" in temp_threshold:
+                    new_threshold["token_id"] = temp_threshold["token_id"]
+                
+                self.stop_loss_thresholds[position_key] = new_threshold
                 self._save_state()
                 
                 logger.info(
@@ -252,13 +279,19 @@ class StopLossManager:
                 tracked_entry = existing_threshold.get("entry_price", 0.0)
                 if abs(entry_price - tracked_entry) > 0.001:
                     # Entry price changed, update threshold
-                    self.stop_loss_thresholds[position_key] = {
+                    updated_threshold = {
                         "stop_price": stop_price,
                         "entry_price": entry_price,
                         "shares": shares,
                         "created_at": existing_threshold.get("created_at"),
                         "updated_at": datetime.now(timezone.utc).isoformat(),
                     }
+                    
+                    # Preserve token_id if present
+                    if "token_id" in existing_threshold:
+                        updated_threshold["token_id"] = existing_threshold["token_id"]
+                    
+                    self.stop_loss_thresholds[position_key] = updated_threshold
                     self._save_state()
                     
                     logger.info(
@@ -274,6 +307,19 @@ class StopLossManager:
                 side="sell",  # We're selling, so get best bid price
                 outcome=normalized_outcome
             )
+            
+            # If metadata unavailable, try token_id fallback
+            if current_price is None:
+                token_id = existing_threshold.get("token_id") if existing_threshold else None
+                if token_id:
+                    logger.debug(
+                        f"Market metadata unavailable for {market_slug}, "
+                        f"using token_id={token_id} for orderbook lookup"
+                    )
+                    current_price = await self.api_client.get_best_price_by_token_id(
+                        token_id=token_id,
+                        side="sell"
+                    )
             
             if current_price is None:
                 if normalization_failed:
