@@ -478,6 +478,7 @@ class StopLossManager:
                 side="SELL",
                 shares=shares,
                 price=stop_price,
+                convert_no_price=False,  # Don't invert NO prices for SELL orders
             )
             
             if result:

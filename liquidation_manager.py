@@ -372,6 +372,7 @@ class LiquidationManager:
                 side="SELL",
                 shares=shares,
                 price=Config.LIQUIDATION_PRICE,
+                convert_no_price=False,  # Don't invert NO prices for SELL orders
             )
             
             if result:
