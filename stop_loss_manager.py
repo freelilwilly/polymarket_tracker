@@ -153,6 +153,8 @@ class StopLossManager:
             # Canonicalize legacy outcome aliases (e.g., team names) to yes/no
             normalized_outcome = outcome
             outcome_lower = str(outcome or "").strip().lower()
+            normalization_failed = False
+            
             if outcome_lower not in ("yes", "no"):
                 resolved = await self.api_client.normalize_outcome_to_yes_no(
                     market_slug,
@@ -166,6 +168,39 @@ class StopLossManager:
                         alias_outcome=outcome,
                     )
                     normalized_outcome = resolved
+                else:
+                    # Normalization failed - try to infer from US API positions
+                    normalization_failed = True
+                    logger.debug(
+                        f"Outcome normalization unavailable: {market_slug} | {outcome}, "
+                        f"attempting fallback via API position lookup"
+                    )
+                    
+                    api_positions = await self.api_client.get_positions()
+                    if api_positions:
+                        for api_pos in api_positions:
+                            api_market = str(api_pos.get("marketSlug") or api_pos.get("market_slug") or "").strip()
+                            # Normalize market slug (remove aec- prefix for comparison)
+                            if api_market.startswith("aec-"):
+                                api_market = api_market[4:]
+                            
+                            if api_market == market_slug:
+                                # Found matching market - use API's outcome field
+                                api_outcome = str(api_pos.get("outcome") or "").strip().lower()
+                                if api_outcome in ("yes", "no"):
+                                    normalized_outcome = api_outcome
+                                    logger.info(
+                                        f"Inferred outcome from API position: {market_slug} | "
+                                        f"{outcome} -> {api_outcome}"
+                                    )
+                                    # Reconcile for future use
+                                    self.position_manager.reconcile_outcome_alias(
+                                        market_slug=market_slug,
+                                        canonical_outcome=api_outcome,
+                                        alias_outcome=outcome,
+                                    )
+                                    normalization_failed = False
+                                break
 
             shares = position["shares"]
             entry_price = position.get("entry_price", 0.0)
@@ -241,9 +276,17 @@ class StopLossManager:
             )
             
             if current_price is None:
-                logger.debug(
-                    f"Cannot check stop-loss: no market price for {market_slug} | {normalized_outcome}"
-                )
+                if normalization_failed:
+                    # Market metadata unavailable - can't monitor stop-loss
+                    logger.warning(
+                        f"Stop-loss monitoring disabled for {market_slug} | {outcome}: "
+                        f"market metadata unavailable, cannot determine price. "
+                        f"Position remains unprotected until metadata available."
+                    )
+                else:
+                    logger.debug(
+                        f"Cannot check stop-loss: no market price for {market_slug} | {normalized_outcome}"
+                    )
                 continue
             
             # Check if current price <= stop price (triggered)
