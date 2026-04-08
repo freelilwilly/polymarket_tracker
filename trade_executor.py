@@ -177,9 +177,19 @@ class TradeExecutor:
             
             # Execute actual buy order (LIVE MODE) as market-style IOC only.
             # Limit price respects tolerance to prevent fills far from observed price.
-            # For NO-side, the API inverts this (1.0 - ioc_price), so observed_price + tolerance
-            # translates to a NO-side limit that prevents egregious fills.
-            ioc_price = min(0.99, observed_price + self.max_price_tolerance)
+            # For NO-side with convert_no_price=True, we need to invert the tolerance logic:
+            #   - observed NO price + tolerance = max NO price we'll pay
+            #   - But convert_no_price inverts our price: 1.0 - ioc_price
+            #   - So to get a NO limit of (observed + tolerance), we need:
+            #     1.0 - ioc_price = observed + tolerance
+            #     ioc_price = 1.0 - (observed + tolerance)
+            if normalized_outcome.lower() == "no":
+                # For NO: invert first, THEN the API's convert_no_price will invert back
+                # This ensures we pay UP TO (observed + tolerance) for NO tokens
+                ioc_price = max(0.01, 1.0 - (observed_price + self.max_price_tolerance))
+            else:
+                # For YES: add tolerance directly
+                ioc_price = min(0.99, observed_price + self.max_price_tolerance)
 
             async def _fetch_buy_execution(order_id_value: str) -> dict[str, Any]:
                 """Poll order details with short backoff and return buy execution summary."""
@@ -216,6 +226,13 @@ class TradeExecutor:
                 state = str(
                     details.get("state") or details.get("status") or details.get("orderState") or ""
                 ).upper()
+                
+                # Log raw API response for debugging IOC order issues
+                logger.info(
+                    f"Order details after polling (7 attempts): order_id={order_id_value} | "
+                    f"state={state or 'EMPTY'} | API_response_keys={list(details.keys()) if details else []} | "
+                    f"full_response={details}"
+                )
 
                 cum_data = (
                     details.get("cumQuantity")
@@ -313,6 +330,13 @@ class TradeExecutor:
             filled_qty = to_float(first_exec.get("cum_qty"), default=0.0)
             avg_fill_px = to_float(first_exec.get("avg_px"), default=0.0)
             order_state = str(first_exec.get("state") or "")
+            
+            # Log raw execution response for debugging IOC order issues
+            logger.info(
+                f"IOC buy execution polled: {market_slug} | order_id={first_order_id} | "
+                f"state={order_state or 'EMPTY'} | filled={filled_qty} | avg_px={avg_fill_px} | "
+                f"raw_exec_keys={list(first_exec.keys())}"
+            )
 
             if is_no_side and filled_qty <= 0 and not used_no_basis_fallback:
                 retry_attempt = await _submit_buy_ioc(convert_no_price=False)
