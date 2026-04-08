@@ -341,8 +341,9 @@ class PolymarketAPIClient:
                         ):
                             # Newly-submitted orders can be briefly unavailable on details
                             # endpoint due to backend visibility lag.
-                            logger.debug(
-                                f"Order details not visible yet: {method} {url} -> {response.status}: {text}"
+                            logger.info(
+                                f"Order details not found (likely expired IOC): {method} {url} -> "
+                                f"{response.status}: {text[:200]}"
                             )
                         else:
                             logger.warning(
