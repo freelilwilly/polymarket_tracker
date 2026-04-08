@@ -954,6 +954,53 @@ class PolymarketAPIClient:
         logger.warning(f"No valid prices in order book for token_id={token_id}")
         return None
     
+    async def get_market_info_by_token_id(self, token_id: str) -> Optional[dict[str, Any]]:
+        """
+        Get market info by querying CLOB API with a token_id.
+        
+        This is a fallback when we have a token_id but no market_slug metadata.
+        
+        Args:
+            token_id: The token ID to look up
+            
+        Returns:
+            Market info dict with tokens array, or None if not found
+        """
+        try:
+            # Query CLOB API sampling endpoint which can return market by token
+            url = f"{self.clob_api_base}/prices-history"
+            params = {"market": token_id, "interval": "max", "fidelity": 1}  
+            data = await self._get_json(url, params=params)
+            
+            if data and isinstance(data, dict):
+                # Try to extract condition_id or market info
+                history = data.get("history", [])
+                if history:
+                    # We got price data, but need market structure
+                    # Try querying the /markets endpoint
+                    pass
+            
+            # Fallback: query /markets and search for this token_id
+            markets_url = f"{self.clob_api_base}/markets"
+            markets_data = await self._get_json(markets_url)
+            
+            if markets_data and isinstance(markets_data, list):
+                for market in markets_data:
+                    if not isinstance(market, dict):
+                        continue  
+                    
+                    tokens = market.get("tokens", [])
+                    for token in tokens:
+                        tid = token.get("token_id") or token.get("tokenId")
+                        if str(tid) == str(token_id):
+                            # Found the market containing this token
+                            return market
+        
+        except Exception as e:
+            logger.debug(f"Error querying market by token_id {token_id}: {e}")
+        
+        return None
+    
     # ==================== US Trading API Methods (Authentication Required) ====================
 
     async def get_account_overview(self) -> Optional[dict[str, float]]:

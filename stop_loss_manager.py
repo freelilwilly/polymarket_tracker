@@ -149,6 +149,11 @@ class StopLossManager:
         for position in positions:
             market_slug = position["market_slug"]
             outcome = position["outcome"]
+            
+            logger.debug(
+                f"Stop-loss check: Processing position market_slug='{market_slug}' "
+                f"outcome='{outcome}' shares={position.get('shares', 0):.2f}"
+            )
 
             # Canonicalize legacy outcome aliases (e.g., team names) to yes/no
             normalized_outcome = outcome
@@ -171,55 +176,194 @@ class StopLossManager:
                 else:
                     # Normalization failed - try to infer from US API positions
                     normalization_failed = True
-                    logger.debug(
+                    logger.info(
                         f"Outcome normalization unavailable: {market_slug} | {outcome}, "
                         f"attempting fallback via API position lookup"
                     )
                     
                     api_positions = await self.api_client.get_positions()
+                    logger.info(f"Fallback: Retrieved {len(api_positions) if api_positions else 0} positions from US API")
+                    
                     if api_positions:
+                        api_markets_seen = []
                         for api_pos in api_positions:
                             api_market = str(api_pos.get("marketSlug") or api_pos.get("market_slug") or "").strip()
-                            # Normalize market slug (remove aec- prefix for comparison)
-                            if api_market.startswith("aec-"):
-                                api_market = api_market[4:]
+                            api_markets_seen.append(api_market)
                             
-                            if api_market == market_slug:
-                                # Found matching market - use API's outcome field
+                            # Normalize market slug (remove aec- prefix for comparison)
+                            normalized_api_market = api_market[4:] if api_market.startswith("aec-") else api_market
+                            
+                            logger.debug(
+                                f"Fallback: Checking position: api_market='{api_market}' "
+                                f"(normalized='{normalized_api_market}') vs target='{market_slug}' | "
+                                f"outcome='{api_pos.get('outcome')}'"
+                            )
+                            
+                            if normalized_api_market == market_slug:
+                                # Found matching market - dump raw data to understand structure
                                 api_outcome = str(api_pos.get("outcome") or "").strip().lower()
+                                raw_data = api_pos.get("raw") or {}
+                                
+                                logger.info(
+                                    f"Fallback: Found matching position! api_outcome='{api_outcome}' | "
+                                    f"raw_keys={list(raw_data.keys())}"
+                                )
+                                logger.info(
+                                    f"Fallback: Raw payload dump: {raw_data}"
+                                )
+                                
+                                # Try to infer yes/no from position data
+                                # Option 1: Check if outcome is already yes/no
+                                token_id = None  # Initialize to avoid reference errors
+                                
                                 if api_outcome in ("yes", "no"):
                                     normalized_outcome = api_outcome
+                                else:
+                                    # Option 2: Check for token index or asset info
+                                    # In CTF markets: index 0 = YES, index 1 = NO
+                                    token_index = raw_data.get("outcomeIndex") or raw_data.get("outcome_index")
                                     
-                                    # Extract token_id from raw position data for orderbook lookup
-                                    raw_data = api_pos.get("raw") or {}
+                                    # Option 3: Check metadata for more info
+                                    metadata = raw_data.get("marketMetadata") or {}
+                                    if isinstance(metadata, dict):
+                                        meta_outcome = str(metadata.get("outcome") or "").strip().lower()
+                                        meta_side = str(metadata.get("side") or "").strip().lower()
+                                        meta_index = metadata.get("outcomeIndex") or metadata.get("index")
+                                        
+                                        logger.info(
+                                            f"Fallback: metadata.outcome='{meta_outcome}', "
+                                            f"metadata.side='{meta_side}', metadata.index={meta_index}"
+                                        )
+                                        
+                                        # Check if metadata has yes/no or side info
+                                        if meta_outcome in ("yes", "no"):
+                                            normalized_outcome = meta_outcome
+                                        elif meta_side in ("yes", "no"):
+                                            normalized_outcome = meta_side
+                                        elif meta_index is not None:
+                                            normalized_outcome = "yes" if int(meta_index) == 0 else "no"
+                                        elif token_index is not None:
+                                            normalized_outcome = "yes" if int(token_index) == 0 else "no"
+                                        
+                                        # Option 4: Infer from team abbreviation in slug
+                                        # For sports markets format: sport-team1-team2-date
+                                        # Team 1 = YES (token 0), Team 2 = NO (token 1)
+                                        team_data = metadata.get("team") or {}
+                                        team_abbr = str(team_data.get("abbreviation") or "").strip().lower()
+                                        
+                                        if team_abbr and normalized_outcome not in ("yes", "no"):
+                                            logger.info(f"Fallback: team.abbreviation='{team_abbr}'")
+                                            
+                                            # Parse market slug to extract team codes
+                                            # Expected format: sport-team1-team2-date
+                                            slug_parts = market_slug.split("-")
+                                            if len(slug_parts) >= 4:
+                                                # Extract team codes (positions 1 and 2 after sport)
+                                                team1_code = slug_parts[1].lower()
+                                                team2_code = slug_parts[2].lower()
+                                                
+                                                logger.info(
+                                                    f"Fallback: Parsed slug teams: team1='{team1_code}' (YES), "
+                                                    f"team2='{team2_code}' (NO)"
+                                                )
+                                                
+                                                # Match team abbreviation to slug position
+                                                if team_abbr == team1_code:
+                                                    normalized_outcome = "yes"
+                                                    logger.info(
+                                                        f"Fallback: Team '{team_abbr}' matches position 1 → YES"
+                                                    )
+                                                elif team_abbr == team2_code:
+                                                    normalized_outcome = "no"
+                                                    logger.info(
+                                                        f"Fallback: Team '{team_abbr}' matches position 2 → NO"
+                                                    )
+                                    
+                                if normalized_outcome not in ("yes", "no"):
+                                    logger.warning(
+                                        f"Fallback: Could not determine yes/no from position metadata. "
+                                        f"api_outcome='{api_outcome}', attempting token_id lookup..."
+                                    )
+                                    
+                                    # Try querying with eventSlug from metadata
+                                    event_slug = raw_data.get("marketMetadata", {}).get("eventSlug")
+                                    if event_slug and str(event_slug).strip():
+                                        logger.info(f"Fallback: Attempting eventSlug lookup: {event_slug}")
+                                        event_market_info = await self.api_client.get_market_info(str(event_slug).strip())
+                                        
+                                        if event_market_info:
+                                            tokens = event_market_info.get("tokens", [])
+                                            logger.info(f"Fallback: Found market via eventSlug with {len(tokens)} tokens")
+                                            
+                                            # We still need to determine which token corresponds to this outcome
+                                            # For now, skip this path - we already have team abbr logic above
+                                
+                                # Extract token_id for orderbook queries (if not already done above)
+                                if not token_id:
                                     token_id = (
                                         raw_data.get("tokenId") or 
                                         raw_data.get("token_id") or
                                         raw_data.get("assetId") or
-                                        raw_data.get("asset_id")
+                                        raw_data.get("asset_id") or
+                                        raw_data.get("asset")
                                     )
-                                    
-                                    if token_id:
-                                        # Store token_id for price lookup (bypass market metadata)
-                                        self.stop_loss_thresholds.setdefault(
-                                            self.position_manager.get_position_key(market_slug, api_outcome),
-                                            {}
-                                        )["token_id"] = str(token_id)
-                                    
-                                    logger.info(
-                                        f"Inferred outcome from API position: {market_slug} | "
-                                        f"{outcome} -> {api_outcome}" +
-                                        (f" | token_id={token_id}" if token_id else "")
+                                
+                                # If still no token_id but we have eventSlug and normalized outcome, try to get tokens
+                                if not token_id and normalized_outcome in ("yes", "no"):
+                                    event_slug = raw_data.get("marketMetadata", {}).get("eventSlug")
+                                    if event_slug:
+                                        market_info = await self.api_client.get_market_info(str(event_slug).strip())
+                                        if market_info:
+                                            tokens = market_info.get("tokens", [])
+                                            # YES = token 0, NO = token 1
+                                            token_idx = 0 if normalized_outcome == "yes" else 1
+                                            if len(tokens) > token_idx:
+                                                token = tokens[token_idx]
+                                                token_id = token.get("token_id") or token.get("tokenId")
+                                                logger.info(
+                                                    f"Fallback: Extracted token_id={token_id} from eventSlug market info "
+                                                    f"(index {token_idx} for {normalized_outcome})"
+                                                )
+                                
+                                logger.info(
+                                    f"Fallback: Extracted token_id='{token_id}' from raw_data keys: {list(raw_data.keys())}"
+                                )
+                                
+                                # Final check: did we successfully determine yes/no?
+                                if normalized_outcome not in ("yes", "no"):
+                                    logger.warning(
+                                        f"Fallback: Exhausted all methods to determine yes/no. "
+                                        f"Position cannot be protected."
                                     )
-                                    
-                                    # Reconcile for future use
-                                    self.position_manager.reconcile_outcome_alias(
-                                        market_slug=market_slug,
-                                        canonical_outcome=api_outcome,
-                                        alias_outcome=outcome,
-                                    )
-                                    normalization_failed = False
+                                    break
+                                
+                                if token_id:
+                                    # Store token_id for price lookup (bypass market metadata)
+                                    self.stop_loss_thresholds.setdefault(
+                                        self.position_manager.get_position_key(market_slug, normalized_outcome),
+                                        {}
+                                    )["token_id"] = str(token_id)
+                                
+                                logger.info(
+                                    f"Inferred outcome from API position: {market_slug} | "
+                                    f"{outcome} -> {normalized_outcome}" +
+                                    (f" | token_id={token_id}" if token_id else "")
+                                )
+                                
+                                # Reconcile for future use
+                                self.position_manager.reconcile_outcome_alias(
+                                    market_slug=market_slug,
+                                    canonical_outcome=normalized_outcome,
+                                    alias_outcome=outcome,
+                                )
+                                normalization_failed = False
                                 break
+                        
+                        if normalization_failed:
+                            logger.warning(
+                                f"Fallback: No matching position found for '{market_slug}'. "
+                                f"API markets seen: {api_markets_seen}"
+                            )
 
             shares = position["shares"]
             entry_price = position.get("entry_price", 0.0)
