@@ -341,7 +341,7 @@ class PolymarketAPIClient:
                         ):
                             # Newly-submitted orders can be briefly unavailable on details
                             # endpoint due to backend visibility lag.
-                            logger.info(
+                            logger.debug(
                                 f"Order details not found (likely expired IOC): {method} {url} -> "
                                 f"{response.status}: {text[:200]}"
                             )
@@ -1276,7 +1276,7 @@ class PolymarketAPIClient:
                     used_slug_base = self._normalize_slug_value(candidate_slug)
                     if used_slug_base and used_slug_base != input_slug_base:
                         self.slug_converter.learn_mapping(input_slug_base, used_slug_base)
-                        logger.info(
+                        logger.debug(
                             f"Learned slug mapping from successful order: {input_slug_base} -> {used_slug_base}"
                         )
                     return {

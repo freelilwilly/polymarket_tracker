@@ -228,7 +228,7 @@ class TradeExecutor:
                 ).upper()
                 
                 # Log raw API response for debugging IOC order issues
-                logger.info(
+                logger.debug(
                     f"Order details after polling (7 attempts): order_id={order_id_value} | "
                     f"state={state or 'EMPTY'} | API_response_keys={list(details.keys()) if details else []} | "
                     f"full_response={details}"
@@ -332,7 +332,7 @@ class TradeExecutor:
             order_state = str(first_exec.get("state") or "")
             
             # Log raw execution response for debugging IOC order issues
-            logger.info(
+            logger.debug(
                 f"IOC buy execution polled: {market_slug} | order_id={first_order_id} | "
                 f"state={order_state or 'EMPTY'} | filled={filled_qty} | avg_px={avg_fill_px} | "
                 f"raw_exec_keys={list(first_exec.keys())}"
