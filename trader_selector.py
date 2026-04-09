@@ -203,6 +203,12 @@ class TraderSelector:
             required_tags = [
                 t.strip() for t in (Config.REQUIRED_TRADER_TAGS or "").split(",") if t.strip()
             ]
+            
+            banned_traders = [
+                t.strip() for t in (Config.BANNED_TRADERS or "").split(",") if t.strip()
+            ]
+            if banned_traders:
+                logger.info(f"Banned traders configured: {', '.join(banned_traders)}")
 
             candidate_pool: list[dict[str, Any]] = []
 
