@@ -364,6 +364,54 @@ class StopLossManager:
                                 f"Fallback: No matching position found for '{market_slug}'. "
                                 f"API markets seen: {api_markets_seen}"
                             )
+            
+            # === CRITICAL FIX: Extract token_id for ALL positions ===
+            # Even if outcome is already yes/no, we need token_id for price monitoring
+            # when Gamma API metadata is unavailable (e.g., Masters markets)
+            position_key = self.position_manager.get_position_key(market_slug, normalized_outcome)
+            existing_threshold = self.stop_loss_thresholds.get(position_key)
+            
+            # Only fetch token_id if we don't already have one
+            if not (existing_threshold and existing_threshold.get("token_id")):
+                try:
+                    api_positions = await self.api_client.get_positions()
+                    if api_positions:
+                        for api_pos in api_positions:
+                            api_market = str(api_pos.get("marketSlug") or api_pos.get("market_slug") or "").strip()
+                            normalized_api_market = api_market[4:] if api_market.startswith("aec-") else api_market
+                            
+                            if normalized_api_market == market_slug:
+                                raw_data = api_pos.get("raw") or {}
+                                token_id = (
+                                    raw_data.get("tokenId") or 
+                                    raw_data.get("token_id") or
+                                    raw_data.get("assetId") or
+                                    raw_data.get("asset_id") or
+                                    raw_data.get("asset")
+                                )
+                                
+                                # If still no token_id, try extracting from eventSlug market info
+                                if not token_id and normalized_outcome in ("yes", "no"):
+                                    event_slug = raw_data.get("marketMetadata", {}).get("eventSlug")
+                                    if event_slug:
+                                        market_info = await self.api_client.get_market_info(str(event_slug).strip())
+                                        if market_info:
+                                            tokens = market_info.get("tokens", [])
+                                            token_idx = 0 if normalized_outcome == "yes" else 1
+                                            if len(tokens) > token_idx:
+                                                token = tokens[token_idx]
+                                                token_id = token.get("token_id") or token.get("tokenId")
+                                
+                                if token_id:
+                                    # Store token_id for price lookup fallback
+                                    self.stop_loss_thresholds.setdefault(position_key, {})["token_id"] = str(token_id)
+                                    logger.info(
+                                        f"Extracted token_id for price monitoring: {market_slug} | "
+                                        f"{normalized_outcome} | token_id={token_id}"
+                                    )
+                                break
+                except Exception as e:
+                    logger.warning(f"Failed to extract token_id for {market_slug}: {e}")
 
             shares = position["shares"]
             entry_price = position.get("entry_price", 0.0)
@@ -395,9 +443,11 @@ class StopLossManager:
             # Get or create threshold tracking
             existing_threshold = self.stop_loss_thresholds.get(position_key)
             
-            if not existing_threshold:
-                # New position, set up stop-loss threshold
-                # Preserve token_id if it was set during fallback
+            # Check if we have a complete threshold (not just token_id)
+            has_complete_threshold = existing_threshold and "entry_price" in existing_threshold
+            
+            if not has_complete_threshold:
+                # New position or incomplete threshold, set up complete stop-loss threshold
                 new_threshold = {
                     "stop_price": stop_price,
                     "entry_price": entry_price,
@@ -405,10 +455,9 @@ class StopLossManager:
                     "created_at": datetime.now(timezone.utc).isoformat(),
                 }
                 
-                # Check if token_id was already stored (from fallback)
-                temp_threshold = self.stop_loss_thresholds.get(position_key, {})
-                if "token_id" in temp_threshold:
-                    new_threshold["token_id"] = temp_threshold["token_id"]
+                # Preserve token_id if it was already extracted
+                if existing_threshold and "token_id" in existing_threshold:
+                    new_threshold["token_id"] = existing_threshold["token_id"]
                 
                 self.stop_loss_thresholds[position_key] = new_threshold
                 self._save_state()
@@ -454,7 +503,9 @@ class StopLossManager:
             
             # If metadata unavailable, try token_id fallback
             if current_price is None:
-                token_id = existing_threshold.get("token_id") if existing_threshold else None
+                # Re-fetch threshold to get latest token_id
+                current_threshold = self.stop_loss_thresholds.get(position_key)
+                token_id = current_threshold.get("token_id") if current_threshold else None
                 if token_id:
                     logger.debug(
                         f"Market metadata unavailable for {market_slug}, "
@@ -466,17 +517,13 @@ class StopLossManager:
                     )
             
             if current_price is None:
-                if normalization_failed:
-                    # Market metadata unavailable - can't monitor stop-loss
-                    logger.warning(
-                        f"Stop-loss monitoring disabled for {market_slug} | {outcome}: "
-                        f"market metadata unavailable, cannot determine price. "
-                        f"Position remains unprotected until metadata available."
-                    )
-                else:
-                    logger.debug(
-                        f"Cannot check stop-loss: no market price for {market_slug} | {normalized_outcome}"
-                    )
+                # CRITICAL: Always log WARNING for positions with stop-loss thresholds
+                # These positions are supposed to be protected but can't be monitored
+                logger.warning(
+                    f"Stop-loss monitoring FAILED for {market_slug} | {normalized_outcome}: "
+                    f"cannot determine current price (metadata unavailable, token_id lookup failed). "
+                    f"Position with entry=${entry_price:.4f}, stop=${stop_price:.4f} remains UNPROTECTED."
+                )
                 continue
             
             # Check if current price <= stop price (triggered)
