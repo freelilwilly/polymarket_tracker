@@ -278,6 +278,15 @@ class TraderSelector:
                 if not wallet:
                     continue
                 
+                # Check banned list (by wallet address or display name)
+                banned_list = [t.strip().lower() for t in (Config.BANNED_TRADERS or "").split(",") if t.strip()]
+                if banned_list:
+                    wallet_lower = str(wallet).strip().lower()
+                    display_name_lower = str(trader.get("display_name") or "").strip().lower()
+                    if wallet_lower in banned_list or display_name_lower in banned_list:
+                        logger.debug(f"Skipping banned trader: {trader.get('display_name') or wallet[:8]}")
+                        continue
+                
                 # Extract performance metrics
                 win_rate = float(trader.get("win_rate") or 0)
                 if 0 <= win_rate <= 1:

@@ -44,6 +44,7 @@ class Config:
     TOP_N_USERS: int = int(os.getenv("TOP_N_USERS", "25"))
     CANDIDATE_LIMIT: int = int(os.getenv("CANDIDATE_LIMIT", "500"))
     REQUIRED_TRADER_TAGS: Optional[str] = os.getenv("REQUIRED_TRADER_TAGS", None)
+    BANNED_TRADERS: Optional[str] = os.getenv("BANNED_TRADERS", None)
     ENABLE_TRADER_SELECTION_FALLBACK: bool = os.getenv("ENABLE_TRADER_SELECTION_FALLBACK", "false").lower() in ("true", "1", "yes")
     
     # Polling Configuration
