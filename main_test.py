@@ -13,11 +13,14 @@ from typing import Any
 from api_client import PolymarketAPIClient
 from config import Config
 from excel_tracker import ExcelTracker
+from liquidation_manager import LiquidationManager
 from position_manager import PositionManager
 from slug_converter import SlugConverter
 from sports_filter import is_sports_market
+from stop_loss_manager import StopLossManager
 from trade_executor import TradeExecutor
 from trade_monitor import TradeMonitor
+from trader_position_monitor import TraderPositionMonitor
 from trader_selector import TraderSelector
 from utils import calculate_multiplier, calculate_percentile, median, to_float
 
@@ -58,6 +61,15 @@ class TestTradingBot:
         self.slug_converter = SlugConverter()
         self.trader_selector = TraderSelector(self.api_client)
         self.trade_monitor = TradeMonitor(self.api_client, self.slug_converter)
+        self.trader_position_monitor = TraderPositionMonitor(self.api_client)
+        self.liquidation_manager = LiquidationManager(
+            self.api_client,
+            self.position_manager,
+        )
+        self.stop_loss_manager = StopLossManager(
+            self.api_client,
+            self.position_manager,
+        )
         self.excel_tracker = ExcelTracker(Config.TEST_EXCEL_WORKBOOK)
         
         self.google_tracker = None
@@ -615,6 +627,7 @@ class TestTradingBot:
             if wallet_key and display_name:
                 self._trader_display_names[wallet_key] = display_name
                 self.trade_monitor.set_wallet_label(wallet_key, display_name)
+                self.trader_position_monitor.set_wallet_label(wallet_key, display_name)
 
             logger.info(
                 f"Selected trader {index}: {self._trader_label(wallet)} | wallet={wallet_key}"
@@ -622,6 +635,7 @@ class TestTradingBot:
 
             historical = await self.api_client.get_user_trades(wallet=wallet, limit=Config.TRADE_PAGE_SIZE)
             self.trade_monitor.initialize_wallet(wallet, historical)
+            self.trader_position_monitor.initialize_wallet(wallet)
 
         logger.info(f"Monitoring {len(self.selected_traders)} traders")
     
@@ -674,10 +688,16 @@ class TestTradingBot:
         
         # Start main loop
         self.running = True
-        await asyncio.gather(
+        loops = [
             self._trade_poll_loop(),
             self._maintenance_loop(),
-        )
+        ]
+        
+        if Config.TRADER_POSITION_MONITORING_ENABLED:
+            loops.append(self._trader_position_monitor_loop())
+            logger.info("Trader position monitoring: ENABLED")
+        
+        await asyncio.gather(*loops)
     
     async def _poll_single_trader(self, trader: dict, semaphore: asyncio.Semaphore):
         wallet = trader.get("wallet")
@@ -790,6 +810,79 @@ class TestTradingBot:
         while self.running:
             try:
                 await self._reconcile_pending_buys()
+
+                # Emergency sell logic - detect positions closed externally (parity with live mode)
+                emergency_sell_candidates = []
+                if Config.TRADER_POSITION_MONITORING_ENABLED:
+                    for position in self.position_manager.get_all_positions():
+                        market_slug = position.get("market_slug")
+                        outcome = position.get("outcome")
+                        shares = position.get("shares", 0.0)
+                        monitored_trader = position.get("monitored_trader")
+                        
+                        if not market_slug or not outcome or shares <= 0 or not monitored_trader:
+                            continue
+                        
+                        trader_has_position = await self.trader_position_monitor.trader_still_has_position(
+                            monitored_trader, market_slug, outcome
+                        )
+                        
+                        if trader_has_position is False:
+                            emergency_sell_candidates.append({
+                                "market_slug": market_slug,
+                                "outcome": outcome,
+                                "shares": shares,
+                                "monitored_trader": monitored_trader,
+                                "reason": "trader_position_externally_closed",
+                            })
+                
+                # Execute emergency sells
+                if emergency_sell_candidates:
+                    for candidate in emergency_sell_candidates:
+                        market_slug = candidate.get("market_slug")
+                        outcome = candidate.get("outcome")
+                        shares = candidate.get("shares", 0.0)
+                        monitored_trader = candidate.get("monitored_trader", "unknown")
+                        reason = candidate.get("reason", "unknown")
+                        
+                        logger.warning(
+                            f"EMERGENCY SELL triggered (TEST): {market_slug} | {outcome} | "
+                            f"{shares:.2f} shares | trader={monitored_trader} | reason={reason}"
+                        )
+                        
+                        try:
+                            result = await self.trade_executor.execute_sell(
+                                market_slug=market_slug,
+                                shares=shares,
+                                outcome=outcome,
+                                allow_full_liquidation_on_oversell=True,
+                                treat_as_market=True,
+                            )
+                            
+                            if result and not result.get("skipped"):
+                                logger.info(
+                                    f"EMERGENCY SELL executed (TEST): {market_slug} | {outcome} | "
+                                    f"{shares:.2f} shares"
+                                )
+                            elif result and result.get("skipped"):
+                                logger.warning(
+                                    f"EMERGENCY SELL skipped (TEST): {market_slug} | {outcome} | "
+                                    f"reason={result.get('reason', 'unknown')}"
+                                )
+                            else:
+                                logger.error(
+                                    f"EMERGENCY SELL failed (TEST): {market_slug} | {outcome}"
+                                )
+                        except Exception as e:
+                            logger.exception(
+                                f"Error executing emergency sell (TEST) for {market_slug} | {outcome}: {e}"
+                            )
+
+                if Config.ENABLE_AUTO_LIQUIDATION:
+                    await self.liquidation_manager.manage_liquidation_orders()
+
+                if Config.ENABLE_STOP_LOSS:
+                    await self.stop_loss_manager.manage_stop_loss_orders()
 
                 summary = self.position_manager.get_summary()
                 logger.info(
@@ -1338,6 +1431,14 @@ class TestTradingBot:
                     return
             self._recent_sell_signal_at[dedupe_key] = now
 
+            # Cancel liquidation order if exists (parity with live mode)
+            if Config.ENABLE_AUTO_LIQUIDATION:
+                await self.liquidation_manager.cancel_liquidation_order(market_slug, normalized_outcome)
+
+            # Cancel stop-loss order if exists (parity with live mode)
+            if Config.ENABLE_STOP_LOSS:
+                await self.stop_loss_manager.cancel_stop_loss_order(market_slug, normalized_outcome)
+
             logger.info(
                 f"Processing SELL (SIM): {market_slug} | {outcome.upper()} | "
                 f"Trader: {self._trader_label(trader_wallet)} | {shares_to_sell:.2f} shares"
@@ -1462,11 +1563,106 @@ class TestTradingBot:
             "invested": invested,
         }
     
+    async def _trader_position_monitor_loop(self):
+        """Monitor trader positions to detect exits via GTC limit orders."""
+        logger.info("Starting trader position monitoring loop (TEST)")
+        
+        while self.running:
+            loop_started = asyncio.get_running_loop().time()
+            try:
+                if not self.selected_traders:
+                    await asyncio.sleep(max(1, Config.SCAN_INTERVAL_SECONDS))
+                    continue
+                
+                # Poll each trader's positions
+                for trader in self.selected_traders:
+                    wallet = trader.get("wallet")
+                    if not wallet:
+                        continue
+                    
+                    try:
+                        # Detect position exits
+                        exits = await self.trader_position_monitor.poll_trader_positions(wallet)
+                        
+                        # Process each detected exit as a SELL signal
+                        for exit_event in exits:
+                            await self._handle_trader_position_exit(exit_event)
+                    
+                    except Exception as e:
+                        logger.exception(
+                            f"Error monitoring positions for {self._trader_label(wallet)} (TEST): {e}"
+                        )
+            
+            except Exception as e:
+                logger.exception(f"Error in trader position monitor loop (TEST): {e}")
+            
+            # Run at same interval as maintenance loop
+            elapsed = asyncio.get_running_loop().time() - loop_started
+            sleep_for = max(0.0, float(Config.SCAN_INTERVAL_SECONDS) - elapsed)
+            await asyncio.sleep(sleep_for)
+    
+    async def _handle_trader_position_exit(self, exit_event: dict[str, Any]):
+        """Handle detected trader position exit (TEST mode)."""
+        market_slug = exit_event.get("market_slug")
+        outcome = exit_event.get("outcome")
+        trader_wallet = exit_event.get("trader_wallet")
+        trader_label = exit_event.get("trader_label", "UNKNOWN")
+        reduction_ratio = exit_event.get("reduction_ratio", 0.0)
+        
+        if not market_slug or not outcome or not trader_wallet:
+            return
+        
+        # Only process if we have attributed shares from this trader
+        attributed_shares = self.position_manager.get_trader_attributed_shares(
+            market_slug, outcome, trader_wallet
+        )
+        
+        if attributed_shares <= 0:
+            logger.debug(
+                f"Skipping trader exit (no attributed shares, TEST): {market_slug} | {outcome.upper()} | "
+                f"Trader: {trader_label}"
+            )
+            return
+        
+        logger.warning(
+            f"TRADER EXIT DETECTED (we have position, TEST): {market_slug} | {outcome.upper()} | "
+            f"Trader: {trader_label} | {reduction_ratio*100:.1f}% reduction | "
+            f"Our shares from trader: {attributed_shares:.2f}"
+        )
+        
+        # Create synthetic SELL signal
+        synthetic_sell = {
+            "market_slug": market_slug,
+            "outcome": outcome,
+            "side": "SELL",
+            "price": 0.50,
+            "size": 0,
+            "_synthetic_exit": True,
+            "_exit_ratio": reduction_ratio,
+        }
+        
+        # Process as regular SELL signal
+        await self._handle_sell_signal(
+            market_slug=market_slug,
+            outcome=outcome,
+            trader_wallet=trader_wallet,
+            trade=synthetic_sell,
+            observed_size=0,
+        )
+    
     async def shutdown(self):
         """Shutdown the bot gracefully."""
         logger.info("\nShutting down...")
         
         self.running = False
+        
+        # Cancel all liquidation orders (parity with live mode)
+        if Config.ENABLE_AUTO_LIQUIDATION:
+            await self.liquidation_manager.cancel_all_liquidation_orders()
+        
+        # Cancel all stop-loss orders (parity with live mode)
+        if Config.ENABLE_STOP_LOSS:
+            await self.stop_loss_manager.cancel_all_stop_loss_orders()
         
         # Save slug converter mappings
         self.slug_converter.save_mappings()
