@@ -49,6 +49,7 @@ class PolymarketAPIClient:
 
     STRIPPABLE_SLUG_PREFIXES: set[str] = {
         "aec",
+        "atc",
         "asc",
         "asm",
         "acm",
@@ -116,6 +117,13 @@ class PolymarketAPIClient:
             return value
         return f"aec-{value}"
 
+    @staticmethod
+    def _with_atc_prefix(slug: str) -> str:
+        value = str(slug or "").strip().lower()
+        if value.startswith("atc-"):
+            return value
+        return f"atc-{value}"
+
     def _apply_team_abbreviation_map(self, slug: str) -> str:
         base = self._normalize_slug_value(slug)
         if not base:
@@ -150,9 +158,10 @@ class PolymarketAPIClient:
             seen.add(candidate)
             ordered.append(candidate)
 
-        # Start with raw base and preferred US prefix variant.
+        # Start with raw base and preferred US prefix variants.
         _add(base)
         _add(self._with_aec_prefix(base))
+        _add(self._with_atc_prefix(base))
 
         # Learned EU -> US slug mapping should be attempted early.
         learned = self.slug_converter.get_learned_mapping(base)
@@ -160,18 +169,21 @@ class PolymarketAPIClient:
             learned_base = self._normalize_slug_value(learned)
             _add(learned_base)
             _add(self._with_aec_prefix(learned_base))
+            _add(self._with_atc_prefix(learned_base))
 
         # Deterministic abbreviation substitution fallback.
         mapped = self._apply_team_abbreviation_map(base)
         if mapped and mapped != base:
             _add(mapped)
             _add(self._with_aec_prefix(mapped))
+            _add(self._with_atc_prefix(mapped))
 
         # Reverse abbreviation mapping fallback.
         reverse_mapped = self._apply_team_abbreviation_reverse_map(base)
         if reverse_mapped and reverse_mapped != base:
             _add(reverse_mapped)
             _add(self._with_aec_prefix(reverse_mapped))
+            _add(self._with_atc_prefix(reverse_mapped))
 
         # If learned mapping also has additional abbreviations, include it too.
         if learned:
@@ -179,10 +191,12 @@ class PolymarketAPIClient:
             if mapped_learned:
                 _add(mapped_learned)
                 _add(self._with_aec_prefix(mapped_learned))
+                _add(self._with_atc_prefix(mapped_learned))
             reverse_mapped_learned = self._apply_team_abbreviation_reverse_map(learned)
             if reverse_mapped_learned:
                 _add(reverse_mapped_learned)
                 _add(self._with_aec_prefix(reverse_mapped_learned))
+                _add(self._with_atc_prefix(reverse_mapped_learned))
 
         return ordered[:12]
 

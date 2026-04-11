@@ -378,9 +378,21 @@ class StopLossManager:
                     if api_positions:
                         for api_pos in api_positions:
                             api_market = str(api_pos.get("marketSlug") or api_pos.get("market_slug") or "").strip()
-                            normalized_api_market = api_market[4:] if api_market.startswith("aec-") else api_market
+                            # Strip all known API prefixes for comparison (aec-, atc-, asc-, asm-, acm-, acx-)
+                            normalized_api_market = api_market
+                            for prefix in ["aec-", "atc-", "asc-", "asm-", "acm-", "acx-"]:
+                                if normalized_api_market.startswith(prefix):
+                                    normalized_api_market = normalized_api_market[len(prefix):]
+                                    break
                             
-                            if normalized_api_market == market_slug:
+                            # Also normalize market_slug for comparison
+                            normalized_market_slug = market_slug
+                            for prefix in ["aec-", "atc-", "asc-", "asm-", "acm-", "acx-"]:
+                                if normalized_market_slug.startswith(prefix):
+                                    normalized_market_slug = normalized_market_slug[len(prefix):]
+                                    break
+                            
+                            if normalized_api_market == normalized_market_slug:
                                 raw_data = api_pos.get("raw") or {}
                                 token_id = (
                                     raw_data.get("tokenId") or 
